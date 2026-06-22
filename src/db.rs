@@ -268,7 +268,7 @@ pub async fn list_payments_keyset(
     let rows = match (status, cursor) {
         (None, None) => sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
         )
         .bind(limit)
@@ -277,7 +277,7 @@ pub async fn list_payments_keyset(
 
         (None, Some((ts, cid))) => sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
@@ -291,7 +291,7 @@ pub async fn list_payments_keyset(
 
         (Some(s), None) => sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
         )
         .bind(s)
@@ -301,7 +301,7 @@ pub async fn list_payments_keyset(
 
         (Some(s), Some((ts, cid))) => sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
-                    webhook_url, tx_hash, paid_amount, created_at, updated_at
+                    webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",

@@ -1,5 +1,7 @@
 # StellarGate
 
+[![CI](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml)
+
 A developer-friendly payment gateway API built on [Stellar](https://stellar.org) for accepting, verifying, and managing payments in XLM and USDC.
 
 > Think Stripe — but powered by the Stellar blockchain instead of banks.

@@ -4,29 +4,26 @@ use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
-use stellargate::{api, config::Config, db, AppState};
+use stellargate::{api, config::{Config, ListenerMode}, db, AppState};
 use time::format_description::well_known::Rfc3339;
 
-async fn test_server_with_pool() -> (TestServer, db::Db) {
-    let cfg = Config {
+fn make_config() -> Config {
+    Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         gateway_secret: String::new(),
-        usdc_issuer: String::new(),
+        usdc_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
         payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],
+        listener_mode: ListenerMode::Poll,
     }
-}
-
-async fn test_server() -> TestServer {
-    test_server_with_pool().await.0
 }
 
 async fn test_server_with_pool() -> (TestServer, db::Db) {

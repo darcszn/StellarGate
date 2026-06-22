@@ -24,7 +24,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     let expired = db::expire_overdue(&state.pool).await?;
     for payment in &expired {
         info!(payment_id = %payment.id, "payment intent expired");
-        webhook::dispatch(state, payment, EXPIRED_EVENT).await;
+        webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
     }
     Ok(expired.len())
 }

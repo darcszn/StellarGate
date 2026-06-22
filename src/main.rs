@@ -3,7 +3,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use stellargate::{api, config::Config, db, expiry, horizon, AppState};
+use stellargate::{api, config::{Config, ListenerMode}, db, expiry, horizon, AppState};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
