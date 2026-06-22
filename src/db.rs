@@ -3,6 +3,26 @@ use sqlx::{Pool, Row, Sqlite};
 
 pub type Db = Pool<Sqlite>;
 
+/// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
+///
+/// Handles both legacy rows (`"2026-04-29 15:00:00"` / `"2026-04-29T15:00:00"`)
+/// and already-correct rows (`"2026-04-29T15:00:00Z"`). Any value that doesn't
+/// look like a 19-character datetime is returned unchanged so we never silently
+/// corrupt unexpected data.
+fn normalize_ts(raw: &str) -> String {
+    let s = raw.trim();
+    // Already has an explicit offset/Z — nothing to do.
+    if s.ends_with('Z') || s.contains('+') {
+        return s.to_string();
+    }
+    // Replace the space separator with T if present, then append Z.
+    if s.len() == 19 {
+        let with_t = s.replacen(' ', "T", 1);
+        return format!("{with_t}Z");
+    }
+    s.to_string()
+}
+
 pub async fn migrate(pool: &Db) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS payments (
@@ -16,8 +36,8 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             webhook_url TEXT,
             tx_hash TEXT,
             paid_amount TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
     .execute(pool)
@@ -39,11 +59,27 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
     .execute(pool)
     .await?;
+
+    // Normalise legacy rows that were written by the old datetime('now') default,
+    // which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
+    // startup — the WHERE clause skips rows that are already RFC 3339.
+    for tbl_col in [
+        ("payments", "created_at"),
+        ("payments", "updated_at"),
+        ("webhook_deliveries", "created_at"),
+    ] {
+        let sql = format!(
+            "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
+            tbl_col.0,
+            col = tbl_col.1
+        );
+        sqlx::query(&sql).execute(pool).await?;
+    }
 
     Ok(())
 }
@@ -76,8 +112,8 @@ fn row_to_payment(row: &sqlx::sqlite::SqliteRow) -> Payment {
         webhook_url: row.get("webhook_url"),
         tx_hash: row.get("tx_hash"),
         paid_amount: row.get("paid_amount"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+        created_at: normalize_ts(&row.get::<String, _>("created_at")),
+        updated_at: normalize_ts(&row.get::<String, _>("updated_at")),
     }
 }
 
@@ -205,7 +241,7 @@ pub async fn update_payment_status(
     paid_amount: &str,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE payments SET status = ?, tx_hash = ?, paid_amount = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE payments SET status = ?, tx_hash = ?, paid_amount = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
     .bind(tx_hash)
@@ -245,7 +281,7 @@ pub async fn save_webhook_delivery(
 
 pub async fn update_webhook_delivery(pool: &Db, id: &str, status: &str, attempts: i64) -> Result<()> {
     sqlx::query(
-        "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = datetime('now') WHERE id = ?",
+        "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
     .bind(attempts)

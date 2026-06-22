@@ -6,6 +6,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{api, config::Config, db, AppState};
+use time::format_description::well_known::Rfc3339;
 
 async fn test_server() -> TestServer {
     let cfg = Config {
@@ -50,6 +51,27 @@ async fn test_create_payment() {
     assert_eq!(body["memo"].as_str().unwrap().len(), 8);
 }
 
+/// Timestamps must be strict RFC 3339 UTC with an explicit Z suffix.
+/// Parsing with `time::OffsetDateTime::parse` using the Rfc3339 format
+/// ensures "2026-04-29 15:00:00" (space, no Z) would fail, while
+/// "2026-04-29T15:00:00Z" succeeds.
+#[tokio::test]
+async fn test_timestamps_are_rfc3339_utc() {
+    let res = test_server().await
+        .post("/payments")
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let body: Value = res.json();
+
+    for field in ["created_at", "updated_at"] {
+        let ts = body[field].as_str().unwrap_or_else(|| panic!("{field} missing"));
+        time::OffsetDateTime::parse(ts, &Rfc3339)
+            .unwrap_or_else(|e| panic!("{field} = {ts:?} is not valid RFC 3339: {e}"));
+        assert!(ts.ends_with('Z'), "{field} = {ts:?} must have explicit Z suffix");
+    }
+}
+
 #[tokio::test]
 async fn test_create_invalid_asset() {
     let res = test_server().await
@@ -78,7 +100,15 @@ async fn test_get_by_id() {
 
     let res = server.get(&format!("/payments/{id}")).await;
     res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["id"], id);
+    let body = res.json::<Value>();
+    assert_eq!(body["id"], id);
+
+    // Timestamps on the GET response must also be strict RFC 3339.
+    for field in ["created_at", "updated_at"] {
+        let ts = body[field].as_str().unwrap_or_else(|| panic!("{field} missing"));
+        time::OffsetDateTime::parse(ts, &Rfc3339)
+            .unwrap_or_else(|e| panic!("{field} = {ts:?} is not valid RFC 3339: {e}"));
+    }
 }
 
 #[tokio::test]
