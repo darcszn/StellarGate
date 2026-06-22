@@ -33,6 +33,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 /// Key under which the last fully-processed Horizon paging token is stored in
@@ -325,7 +326,7 @@ async fn settle(
 
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
-pub async fn run_poller(state: Arc<AppState>) {
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
         return;
@@ -339,7 +340,13 @@ pub async fn run_poller(state: Arc<AppState>) {
     );
 
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                info!("Horizon poller shutting down");
+                return;
+            }
+        }
         match poll_once(&state).await {
             Ok(0) => debug!("poll: nothing to settle"),
             Ok(n) => info!(settled = n, "poll cycle settled payments"),
@@ -387,7 +394,7 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(state: Arc<AppState>) {
+pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
         return;
@@ -417,18 +424,30 @@ pub async fn run_stream_listener(state: Arc<AppState>) {
 
     loop {
         let cursor_before = cursor.clone();
-        match stream_once(&state, &client, &mut cursor).await {
-            Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
-            Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
+        tokio::select! {
+            result = stream_once(&state, &client, &mut cursor) => {
+                match result {
+                    Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
+                    Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
+                }
+            }
+            _ = shutdown.changed() => {
+                info!("Horizon stream listener shutting down");
+                return;
+            }
         }
 
-        // Reset backoff whenever the connection made progress (advanced the
-        // cursor), so a long-lived stream that drops once reconnects promptly.
         if cursor != cursor_before {
             backoff = base_backoff;
         }
 
-        tokio::time::sleep(backoff).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown.changed() => {
+                info!("Horizon stream listener shutting down");
+                return;
+            }
+        }
         backoff = (backoff * 2).min(max_backoff);
     }
 }

@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{api, config::Config, db, expiry, horizon, AppState};
+use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -32,16 +33,22 @@ async fn main() -> Result<()> {
         http,
     });
 
+    // Broadcast shutdown to all background tasks.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Detect on-chain payments. In stream mode the SSE listener settles intents
     // in near real time while the poller runs alongside as a reconciler; in
     // poll mode only the interval poller runs.
-    if cfg.listener_mode == ListenerMode::Stream {
-        tokio::spawn(horizon::run_stream_listener(state.clone()));
-    }
-    tokio::spawn(horizon::run_poller(state.clone()));
-
-    // Background expiry of pending intents that pass their TTL.
-    tokio::spawn(expiry::run_sweeper(state.clone()));
+    let stream_handle = if cfg.listener_mode == ListenerMode::Stream {
+        Some(tokio::spawn(horizon::run_stream_listener(
+            state.clone(),
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
+    let poller_handle = tokio::spawn(horizon::run_poller(state.clone(), shutdown_rx.clone()));
+    let sweeper_handle = tokio::spawn(expiry::run_sweeper(state.clone(), shutdown_rx));
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -50,6 +57,20 @@ async fn main() -> Result<()> {
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Signal background tasks and wait (bounded) for them to finish.
+    let _ = shutdown_tx.send(true);
+    let timeout = Duration::from_secs(30);
+    let bg = async {
+        let _ = poller_handle.await;
+        let _ = sweeper_handle.await;
+        if let Some(h) = stream_handle {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(timeout, bg).await.is_err() {
+        info!("background tasks did not finish within 30s; forcing exit");
+    }
 
     info!("shutdown complete");
     Ok(())
