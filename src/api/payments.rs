@@ -254,6 +254,26 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
     Some((ts.to_string(), id.to_string()))
 }
 
+/// Generates an 8-character uppercase-hex `text` memo (32 bits of entropy,
+/// well within Stellar's 28-byte text memo limit) and confirms it hasn't been
+/// used by *any* payment intent before — `memo_exists` checks the entire
+/// `payments` table, not just pending ones, so a memo is never reused for the
+/// lifetime of the database. That makes the collision probability for a
+/// single call simply `rows-in-table / 2^32`, and the loop retries up to 10
+/// times before giving up; exhausting that before billions of payments exist
+/// is effectively impossible. If traffic ever approaches that scale, widen
+/// the memo (more hex chars, still under the 28-byte limit) rather than
+/// switching scheme.
+///
+/// We chose a `text` memo over `memo_id` (a u64) or `memo_hash`/`memo_return`
+/// (32-byte) because it's the simplest scheme that round-trips a
+/// human-legible reference through Horizon. The tradeoff: Horizon's JSON
+/// `memo` field also holds a string for those other memo types (a decimal
+/// string for `memo_id`, base64 for `memo_hash`/`memo_return`), and a
+/// `memo_id` consisting only of digits could coincidentally render as the
+/// same text as one of our hex memos. `horizon::HorizonPayment::memo()`
+/// guards against this by only matching when Horizon reports `memo_type:
+/// "text"` (see issue #17).
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
     for _ in 0..10 {
         let memo = Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase();
