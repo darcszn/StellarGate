@@ -1,6 +1,7 @@
 use crate::{db, money, AppState};
 use axum::{
-    extract::{Path, Query, State},
+    async_trait,
+    extract::{FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -24,7 +25,7 @@ impl AppError {
         }
     }
 
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
 }
@@ -40,6 +41,43 @@ impl From<anyhow::Error> for AppError {
         // Log the real cause; never leak internals to the client.
         tracing::error!(error = %err, "internal error");
         AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+    }
+}
+
+/// A drop-in replacement for `Json<T>` that maps any deserialization or
+/// content-type failure into our standard `{"error": "..."}` 400 response
+/// instead of axum's default 422 plaintext rejection.
+pub struct JsonBody<T>(pub T);
+
+#[async_trait]
+impl<T, S> FromRequest<S> for JsonBody<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(JsonBody(value)),
+            Err(rejection) => {
+                use axum::extract::rejection::JsonRejection;
+                let message = match &rejection {
+                    JsonRejection::JsonDataError(_) => {
+                        // Deserialization failed: wrong type, missing required field, etc.
+                        format!("invalid request body: {}", rejection.body_text())
+                    }
+                    JsonRejection::JsonSyntaxError(_) => {
+                        "request body contains malformed JSON".to_string()
+                    }
+                    JsonRejection::MissingJsonContentType(_) => {
+                        "Content-Type must be application/json".to_string()
+                    }
+                    _ => "invalid request body".to_string(),
+                };
+                Err(AppError::bad_request(message))
+            }
+        }
     }
 }
 
@@ -60,7 +98,7 @@ fn default_asset() -> String {
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreatePaymentRequest>,
+    JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     if !SUPPORTED_ASSETS.contains(&asset.as_str()) {

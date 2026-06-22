@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use axum::body::Bytes;
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -152,4 +153,41 @@ async fn test_unknown_route_returns_json_404() {
     let res = test_server().await.get("/nope").await;
     res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(res.json::<Value>()["error"], "not found");
+}
+
+#[tokio::test]
+async fn test_malformed_json_body_returns_400_json_error() {
+    let server = test_server().await;
+    let res = server
+        .post("/payments")
+        .content_type("application/json")
+        .bytes(Bytes::from_static(b"{not valid json}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert!(body["error"].as_str().is_some(), "expected an error field");
+}
+
+#[tokio::test]
+async fn test_missing_amount_returns_400_json_error() {
+    let res = test_server().await
+        .post("/payments")
+        .json(&json!({ "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert!(body["error"].as_str().is_some(), "expected an error field");
+}
+
+#[tokio::test]
+async fn test_wrong_content_type_returns_400_json_error() {
+    let server = test_server().await;
+    let res = server
+        .post("/payments")
+        .content_type("text/plain")
+        .bytes(Bytes::from_static(b"amount=10"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert!(body["error"].as_str().is_some(), "expected an error field");
 }
