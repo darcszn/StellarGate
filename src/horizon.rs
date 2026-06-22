@@ -307,7 +307,7 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
         .and_then(money::parse_stroops)
         .unwrap_or(0);
 
-    match verify(&payment, hp, &state.config.accepted_assets, already_paid_stroops) {
+    match verify(&payment, hp, &state.config.usdc_issuer, already_paid_stroops) {
         Some(Verdict::Completed { tx_hash, paid_amount }) => {
             settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
             Ok(true)
@@ -791,7 +791,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, USDC_ISSUER, 0),
             Some(Verdict::Completed { .. })
         ));
     }

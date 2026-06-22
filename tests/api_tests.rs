@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
-use stellargate::{api, config::{AcceptedAsset, Config, ListenerMode}, db, AppState};
+use stellargate::{api, config::{Config, ListenerMode}, db, AppState};
 use time::format_description::well_known::Rfc3339;
 
 fn make_config() -> Config {
@@ -15,7 +15,7 @@ fn make_config() -> Config {
         horizon_url: String::new(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         gateway_secret: String::new(),
-        accepted_assets: AcceptedAsset::default_list(),
+        usdc_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
@@ -46,6 +46,14 @@ async fn test_server() -> TestServer {
 async fn test_health() {
     let res = test_server().await.get("/health").await;
     res.assert_status_ok();
+    assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_ready_ok_with_live_db() {
+    let res = test_server().await.get("/ready").await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
 }
 
 #[tokio::test]

@@ -225,8 +225,19 @@ List payments, newest first.
 
 ### `GET /health`
 
+Cheap liveness probe. Always returns `200 OK` as long as the process is running.
+
 ```json
 200 OK — { "status": "ok" }
+```
+
+### `GET /ready`
+
+Readiness probe. Runs `SELECT 1` against the database; returns `503` when unreachable.
+
+```json
+200 OK          — { "status": "ok" }
+503 Unavailable — { "status": "unavailable" }
 ```
 
 ## Payment Flow

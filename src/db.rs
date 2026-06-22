@@ -524,6 +524,13 @@ pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookD
     Ok(row.as_ref().map(row_to_webhook_delivery))
 }
 
+/// Probe database connectivity. Returns `Ok(())` if the pool can execute a
+/// trivial query, or `Err` if the database is unreachable.
+pub async fn ping(pool: &Db) -> Result<()> {
+    sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(pool).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
