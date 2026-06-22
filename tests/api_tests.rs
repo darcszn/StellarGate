@@ -20,6 +20,7 @@ async fn test_server() -> TestServer {
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
+        cors_allowed_origins: vec![],
     };
     let pool = SqlitePoolOptions::new()
         .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap().create_if_missing(true))
