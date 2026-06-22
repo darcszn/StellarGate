@@ -79,6 +79,22 @@ pub fn is_valid_amount(input: &str) -> bool {
     parse_stroops(input).is_some()
 }
 
+/// Format a stroop count as a minimal-decimal Stellar amount string.
+///
+/// Trailing fractional zeros are stripped so the result is compact:
+/// `10_000_000` → `"1"`, `15_500_000` → `"1.55"`, `5_000_000` → `"0.5"`.
+pub fn stroops_to_string(stroops: i64) -> String {
+    let whole = stroops / STROOPS_PER_UNIT;
+    let frac = stroops % STROOPS_PER_UNIT;
+    if frac == 0 {
+        format!("{whole}")
+    } else {
+        let padded = format!("{frac:07}");
+        let trimmed = padded.trim_end_matches('0');
+        format!("{whole}.{trimmed}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +122,17 @@ mod tests {
         assert_eq!(parse_stroops("1e3"), None);
         assert_eq!(parse_stroops("1.00000001"), None); // 8 decimals
         assert_eq!(parse_stroops("9999999999999999999"), None); // overflow
+    }
+
+    #[test]
+    fn stroops_to_string_works() {
+        assert_eq!(stroops_to_string(10_000_000), "1");
+        assert_eq!(stroops_to_string(100_000_000), "10");
+        assert_eq!(stroops_to_string(15_000_000), "1.5");
+        assert_eq!(stroops_to_string(15_500_000), "1.55");
+        assert_eq!(stroops_to_string(5_000_000), "0.5");
+        assert_eq!(stroops_to_string(1), "0.0000001");
+        assert_eq!(stroops_to_string(105_000_000), "10.5");
     }
 
     #[test]
