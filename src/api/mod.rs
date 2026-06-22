@@ -17,6 +17,7 @@ mod payments;
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
+    let cors = build_cors(&state.config);
     axum::Router::new()
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
@@ -25,8 +26,42 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .fallback(not_found)
         .layer(TraceLayer::new_for_http())
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
+}
+
+fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
+    use axum::http::HeaderName;
+    use tower_http::cors::AllowOrigin;
+
+    let origins = &cfg.cors_allowed_origins;
+
+    if origins.is_empty() {
+        if cfg.network == "public" {
+            tracing::warn!(
+                "CORS_ALLOWED_ORIGINS is not set on a public-network deployment. \
+                 All origins are allowed — set CORS_ALLOWED_ORIGINS in production."
+            );
+        }
+        return CorsLayer::permissive();
+    }
+
+    let allow_origins: Vec<axum::http::HeaderValue> = origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(allow_origins))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("authorization"),
+        ])
 }
 
 async fn health() -> impl IntoResponse {
