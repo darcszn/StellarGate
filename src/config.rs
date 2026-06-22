@@ -24,6 +24,51 @@ impl ListenerMode {
     }
 }
 
+/// A Stellar asset the gateway is configured to accept.
+///
+/// `issuer` is `None` for the native XLM asset; all other assets require an
+/// issuer address. Configure via `ACCEPTED_ASSETS` as comma-separated entries
+/// of the form `CODE` (native) or `CODE:ISSUER`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedAsset {
+    pub code: String,
+    pub issuer: Option<String>,
+}
+
+impl AcceptedAsset {
+    fn parse_list(raw: &str) -> Vec<Self> {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|entry| {
+                if let Some((code, issuer)) = entry.split_once(':') {
+                    AcceptedAsset {
+                        code: code.trim().to_uppercase(),
+                        issuer: Some(issuer.trim().to_string()),
+                    }
+                } else {
+                    AcceptedAsset {
+                        code: entry.trim().to_uppercase(),
+                        issuer: None,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    pub fn default_list() -> Vec<Self> {
+        vec![
+            AcceptedAsset { code: "XLM".into(), issuer: None },
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some(
+                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
+                ),
+            },
+        ]
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub port: u16,
@@ -32,7 +77,9 @@ pub struct Config {
     pub horizon_url: String,
     pub gateway_public: String,
     pub gateway_secret: String,
-    pub usdc_issuer: String,
+    /// Assets the gateway will accept, validated on POST /payments and in verify().
+    /// Configure via ACCEPTED_ASSETS=XLM,USDC:GISSUER (comma-separated).
+    pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
@@ -55,10 +102,14 @@ impl Config {
             horizon_url: env_or("STELLAR_HORIZON_URL", "https://horizon-testnet.stellar.org"),
             gateway_public: env_or("STELLAR_GATEWAY_PUBLIC", "UNCONFIGURED"),
             gateway_secret: env_or("STELLAR_GATEWAY_SECRET", ""),
-            usdc_issuer: env_or(
-                "USDC_ISSUER",
-                "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
-            ),
+            accepted_assets: {
+                let raw = std::env::var("ACCEPTED_ASSETS").unwrap_or_default();
+                if raw.is_empty() {
+                    AcceptedAsset::default_list()
+                } else {
+                    AcceptedAsset::parse_list(&raw)
+                }
+            },
             webhook_secret: env_or("WEBHOOK_SECRET", "default-secret"),
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
@@ -93,7 +144,7 @@ impl std::fmt::Debug for Config {
             .field("horizon_url", &self.horizon_url)
             .field("gateway_public", &self.gateway_public)
             .field("gateway_secret", &"***")
-            .field("usdc_issuer", &self.usdc_issuer)
+            .field("accepted_assets", &self.accepted_assets)
             .field("webhook_secret", &"***")
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
@@ -117,7 +168,7 @@ mod tests {
             horizon_url: "https://horizon-testnet.stellar.org".into(),
             gateway_public: "GPUBLIC".into(),
             gateway_secret: "super-secret-key".into(),
-            usdc_issuer: "GISSUER".into(),
+            accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
@@ -130,6 +181,15 @@ mod tests {
         assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
         assert!(!output.contains("webhook-hmac-secret"), "webhook_secret must not appear in Debug output");
         assert!(output.contains("***"), "redacted marker must appear in Debug output");
+    }
+
+    #[test]
+    fn parse_accepted_assets_from_env_string() {
+        let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2");
+        assert_eq!(assets.len(), 3);
+        assert_eq!(assets[0], AcceptedAsset { code: "XLM".into(), issuer: None });
+        assert_eq!(assets[1], AcceptedAsset { code: "USDC".into(), issuer: Some("GISSUER".into()) });
+        assert_eq!(assets[2], AcceptedAsset { code: "EURC".into(), issuer: Some("GISSUER2".into()) });
     }
 }
 

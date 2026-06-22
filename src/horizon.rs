@@ -116,7 +116,7 @@ impl HorizonPayment {
 pub fn verify(
     payment: &db::Payment,
     hp: &HorizonPayment,
-    usdc_issuer: &str,
+    accepted_assets: &[crate::config::AcceptedAsset],
     already_paid_stroops: i64,
 ) -> Option<Verdict> {
     if hp.kind != "payment" {
@@ -129,14 +129,18 @@ pub fn verify(
         return None;
     }
 
-    let asset_matches = match payment.asset.as_str() {
-        "XLM" => hp.asset_type.as_deref() == Some("native"),
-        "USDC" => {
-            hp.asset_code.as_deref() == Some("USDC")
-                && hp.asset_issuer.as_deref() == Some(usdc_issuer)
+    let asset_matches = accepted_assets.iter().any(|a| {
+        if a.code != payment.asset {
+            return false;
         }
-        _ => false,
-    };
+        match a.issuer.as_deref() {
+            None => hp.asset_type.as_deref() == Some("native"),
+            Some(issuer) => {
+                hp.asset_code.as_deref() == Some(a.code.as_str())
+                    && hp.asset_issuer.as_deref() == Some(issuer)
+            }
+        }
+    });
     if !asset_matches {
         return None;
     }
@@ -589,14 +593,16 @@ mod tests {
         }
     }
 
-    const USDC_ISSUER: &str = "GUSDC";
+    fn test_assets() -> Vec<crate::config::AcceptedAsset> {
+        crate::config::AcceptedAsset::parse_list("XLM,USDC:GUSDC")
+    }
 
     #[test]
     fn exact_xlm_payment_completes() {
         let p = pending("XLM", "10.00");
         let hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "10".into(),
@@ -609,7 +615,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("12.5", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "12.5".into(),
@@ -622,7 +628,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("9.9999999", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Underpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "9.9999999".into(),
@@ -636,14 +642,14 @@ mod tests {
         let p = pending("XLM", "5");
         let hp1 = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert!(matches!(
-            verify(&p, &hp1, USDC_ISSUER, 0),
+            verify(&p, &hp1, &test_assets(), 0),
             Some(Verdict::Underpaid { .. })
         ));
 
         // Top-up: 2 XLM arrives; cumulative = 5 = expected — completes exactly.
         let hp2 = native_payment("2.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp2, USDC_ISSUER, 30_000_000),
+            verify(&p, &hp2, &test_assets(), 30_000_000),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "5".into(),
@@ -658,7 +664,7 @@ mod tests {
         // Top-up of 3 XLM; cumulative = 6 > 5 — overpaid.
         let hp = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER, 30_000_000),
+            verify(&p, &hp, &test_assets(), 30_000_000),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "6".into(),
@@ -670,14 +676,14 @@ mod tests {
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
     fn wrong_destination_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "MEMO1234", "GSOMEONEELSE");
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -686,8 +692,8 @@ mod tests {
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.asset_type = Some("credit_alphanum4".into());
         hp.asset_code = Some("USDC".into());
-        hp.asset_issuer = Some(USDC_ISSUER.into());
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        hp.asset_issuer = Some("GUSDC".into());
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]
@@ -698,7 +704,7 @@ mod tests {
             amount: Some("5.0".into()),
             asset_type: Some("credit_alphanum4".into()),
             asset_code: Some("USDC".into()),
-            asset_issuer: Some(USDC_ISSUER.into()),
+            asset_issuer: Some("GUSDC".into()),
             to: Some("GGATEWAY".into()),
             transaction_hash: Some("TXHASH".into()),
             transaction: Some(TransactionRef {
@@ -708,7 +714,7 @@ mod tests {
             paging_token: Some("1".into()),
         };
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -730,10 +736,10 @@ mod tests {
             }),
             paging_token: Some("1".into()),
         };
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
         // Sanity: with the right issuer it would have matched.
-        hp.asset_issuer = Some(USDC_ISSUER.into());
-        assert!(verify(&p, &hp, USDC_ISSUER, 0).is_some());
+        hp.asset_issuer = Some("GUSDC".into());
+        assert!(verify(&p, &hp, &test_assets(), 0).is_some());
     }
 
     #[test]
@@ -741,7 +747,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
-        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
     #[test]

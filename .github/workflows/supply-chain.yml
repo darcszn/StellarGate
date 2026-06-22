@@ -1,0 +1,51 @@
+name: Supply-chain security
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # Every Monday at 09:00 UTC — surfaces newly-disclosed advisories
+    # even when no code has changed.
+    - cron: "0 9 * * 1"
+
+jobs:
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Fails the job if any dependency has a known RustSec advisory.
+      # --deny warnings escalates unmaintained/unsound advisories to errors.
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
+
+  deny:
+    name: cargo deny (licenses + advisories + bans)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # deny.toml at repo root is picked up automatically.
+          # Fail on advisories, license violations, and banned crates.
+          command: check all

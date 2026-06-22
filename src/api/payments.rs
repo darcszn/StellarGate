@@ -77,8 +77,6 @@ where
     }
 }
 
-const SUPPORTED_ASSETS: [&str; 2] = ["XLM", "USDC"];
-
 #[derive(Deserialize)]
 pub struct CreatePaymentRequest {
     pub amount: String,
@@ -97,10 +95,12 @@ pub async fn create(
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
-    if !SUPPORTED_ASSETS.contains(&asset.as_str()) {
+    let accepted = &state.config.accepted_assets;
+    if !accepted.iter().any(|a| a.code == asset) {
+        let codes = accepted.iter().map(|a| a.code.as_str()).collect::<Vec<_>>().join(", ");
         return Err(AppError::bad_request(
             "unsupported_asset",
-            format!("unsupported asset '{}'; supported: {}", body.asset, SUPPORTED_ASSETS.join(", ")),
+            format!("unsupported asset '{}'; supported: {}", body.asset, codes),
         ));
     }
     if !money::is_valid_amount(&body.amount) {
