@@ -240,46 +240,25 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     let mut cursor = starting_cursor(state).await?;
     let mut settled = 0;
 
-        // Skip transactions already recorded for this intent. This prevents
-        // double-counting the original underpayment tx on subsequent poll cycles.
-        let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
-        if payment.tx_hash.as_deref() == Some(hp_hash) {
-            continue;
-        }
+    loop {
+        let page = fetch_recent_payments(
+            &state.http,
+            &state.config.horizon_url,
+            &state.config.gateway_public,
+            &cursor,
+            PAGE_LIMIT,
+        )
+        .await?;
+        let count = page.len();
 
-        // For underpaid intents, carry forward what has already been received.
-        let already_paid_stroops = payment
-            .paid_amount
-            .as_deref()
-            .and_then(money::parse_stroops)
-            .unwrap_or(0);
-
-        match verify(payment, hp, &state.config.usdc_issuer, already_paid_stroops) {
-            Some(Verdict::Completed { tx_hash, paid_amount }) => {
-                settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
-                settled += 1;
+        for hp in &page {
+            if let Some(token) = &hp.paging_token {
+                cursor = token.clone();
             }
-            Some(Verdict::Overpaid { tx_hash, paid_amount }) => {
-                let delta = delta_str(&paid_amount, &payment.amount);
-                info!(
-                    payment_id = %payment.id,
-                    excess = %delta.as_deref().unwrap_or("?"),
-                    "overpayment — intent completed, excess should be refunded"
-                );
-                settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.overpaid", delta.as_deref()).await;
-                settled += 1;
-            }
-            Some(Verdict::Underpaid { tx_hash, paid_amount }) => {
-                let delta = delta_str(&payment.amount, &paid_amount);
-                warn!(
-                    payment_id = %payment.id,
-                    expected = %payment.amount,
-                    paid = %paid_amount,
-                    remaining = %delta.as_deref().unwrap_or("?"),
-                    "underpayment — intent remains open for a top-up"
-                );
-                settle(state, payment, "underpaid", &tx_hash, &paid_amount, "payment.underpaid", delta.as_deref()).await;
-                settled += 1;
+            match reconcile_payment(state, hp).await {
+                Ok(true) => settled += 1,
+                Ok(false) => {}
+                Err(e) => warn!(error = %e, "failed to reconcile polled payment"),
             }
         }
 
@@ -295,6 +274,64 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     }
 
     Ok(settled)
+}
+
+/// Look up the pending intent matching this Horizon payment by memo, verify it,
+/// and settle it if it matches. Returns `true` when an intent was settled.
+async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<bool> {
+    let memo = match hp.memo() {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+
+    let payment = match db::find_pending_by_memo(&state.pool, memo).await? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    // Skip transactions already recorded for this intent. This prevents
+    // double-counting the original underpayment tx on subsequent poll cycles.
+    let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
+    if payment.tx_hash.as_deref() == Some(hp_hash) {
+        return Ok(false);
+    }
+
+    // For underpaid intents, carry forward what has already been received.
+    let already_paid_stroops = payment
+        .paid_amount
+        .as_deref()
+        .and_then(money::parse_stroops)
+        .unwrap_or(0);
+
+    match verify(&payment, hp, &state.config.usdc_issuer, already_paid_stroops) {
+        Some(Verdict::Completed { tx_hash, paid_amount }) => {
+            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
+            Ok(true)
+        }
+        Some(Verdict::Overpaid { tx_hash, paid_amount }) => {
+            let delta = delta_str(&paid_amount, &payment.amount);
+            info!(
+                payment_id = %payment.id,
+                excess = %delta.as_deref().unwrap_or("?"),
+                "overpayment — intent completed, excess should be refunded"
+            );
+            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.overpaid", delta.as_deref()).await;
+            Ok(true)
+        }
+        Some(Verdict::Underpaid { tx_hash, paid_amount }) => {
+            let delta = delta_str(&payment.amount, &paid_amount);
+            warn!(
+                payment_id = %payment.id,
+                expected = %payment.amount,
+                paid = %paid_amount,
+                remaining = %delta.as_deref().unwrap_or("?"),
+                "underpayment — intent remains open for a top-up"
+            );
+            settle(state, &payment, "underpaid", &tx_hash, &paid_amount, "payment.underpaid", delta.as_deref()).await;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Persist a terminal or intermediate status for `payment` and fire its webhook.
@@ -748,7 +785,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER),
+            verify(&p, &hp, USDC_ISSUER, 0),
             Some(Verdict::Completed { .. })
         ));
     }

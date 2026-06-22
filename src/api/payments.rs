@@ -176,7 +176,7 @@ pub async fn list(
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
         let (cursor_ts, cursor_id) = decode_cursor(raw_cursor)
-            .ok_or_else(|| AppError::bad_request("invalid cursor"))?;
+            .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?;
 
         let payments = db::list_payments_keyset(
             &state.pool,
@@ -214,6 +214,17 @@ pub async fn list(
             "next_cursor": next_cursor,
         })))
     }
+}
+
+fn encode_cursor(ts: &str, id: &str) -> String {
+    hex::encode(format!("{}\t{}", ts, id))
+}
+
+fn decode_cursor(raw: &str) -> Option<(String, String)> {
+    let bytes = hex::decode(raw).ok()?;
+    let s = String::from_utf8(bytes).ok()?;
+    let (ts, id) = s.split_once('\t')?;
+    Some((ts.to_string(), id.to_string()))
 }
 
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
