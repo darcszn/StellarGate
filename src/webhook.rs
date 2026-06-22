@@ -24,8 +24,12 @@ pub fn sign(secret: &str, body: &[u8]) -> String {
 }
 
 /// Build the JSON event payload for a payment in a terminal state.
-pub fn build_payload(payment: &db::Payment, event: &str) -> serde_json::Value {
-    json!({
+///
+/// `delta` carries the absolute difference between the requested and received
+/// amounts, and is included in the payload for `payment.overpaid` (excess to
+/// refund) and `payment.underpaid` (shortfall still owed) events.
+pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) -> serde_json::Value {
+    let mut payload = json!({
         "event": event,
         "payment_id": payment.id,
         "merchant_id": payment.merchant_id,
@@ -34,19 +38,26 @@ pub fn build_payload(payment: &db::Payment, event: &str) -> serde_json::Value {
         "paid_amount": payment.paid_amount,
         "asset": payment.asset,
         "status": payment.status,
-    })
+    });
+    if let Some(d) = delta {
+        payload["delta"] = json!(d);
+    }
+    payload
 }
 
 /// Dispatch a webhook for `payment` if it has a `webhook_url`, retrying on
 /// failure per the configured policy. Each attempt and the final outcome are
 /// recorded in the `webhook_deliveries` table. Errors are logged, never
 /// propagated — a failed webhook must not roll back a confirmed payment.
-pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str) {
+///
+/// `delta` is the absolute amount difference included in overpaid/underpaid
+/// events; pass `None` for exact-payment events.
+pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delta: Option<&str>) {
     let Some(url) = payment.webhook_url.clone() else {
         return;
     };
 
-    let payload = build_payload(payment, event);
+    let payload = build_payload(payment, event, delta);
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => b,
         Err(e) => {

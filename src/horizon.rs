@@ -1,17 +1,29 @@
 //! Stellar Horizon integration: detecting and verifying on-chain payments.
 //!
-//! Payments into the gateway account are detected one of two ways (selected by
-//! [`crate::config::ListenerMode`]):
+//! A background poller periodically asks Horizon for the most recent payments
+//! into the gateway account, matches them against pending payment intents by
+//! transaction memo, verifies the asset and amount, and transitions the intent
+//! to a terminal or watchable state, firing a webhook in each case.
 //!
-//! * [`run_stream_listener`] subscribes to Horizon's Server-Sent-Events payment
-//!   stream and settles matching intents within ~1s of a payment landing.
-//! * [`run_poller`] periodically asks Horizon for the most recent payments and
-//!   reconciles them. In stream mode it still runs as a fallback that catches
-//!   any events missed while the stream was reconnecting.
+//! ## Payment resolution policy
 //!
-//! Both paths match records against pending intents by transaction memo, verify
-//! the asset and amount, and transition the intent to `completed` (or `failed`
-//! on underpayment), firing a webhook either way.
+//! | Scenario | DB status | Webhook event | Notes |
+//! |---|---|---|---|
+//! | Paid exactly the requested amount | `completed` | `payment.completed` | — |
+//! | Paid **more** than requested | `completed` | `payment.overpaid` | `delta` = excess; merchant should refund |
+//! | Paid **less** than requested | `underpaid` | `payment.underpaid` | `delta` = shortfall; intent stays watchable |
+//! | Top-up brings total to exactly expected | `completed` | `payment.completed` | — |
+//! | Top-up brings total above expected | `completed` | `payment.overpaid` | `delta` = cumulative excess |
+//!
+//! Once an intent reaches `completed`, it is removed from the watchlist.
+//! Any subsequent on-chain payment to the same address and memo is silently
+//! ignored — it will not trigger an additional webhook.
+//!
+//! Only a single follow-up (top-up) payment is supported per underpaid intent:
+//! `tx_hash` records the most recent processed transaction. If more than one
+//! partial payment is needed, the user should send the full remaining balance
+//! (shown in the `delta` field of the `payment.underpaid` event) in one
+//! transaction.
 //!
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
 //! functions wrap it with I/O.
@@ -68,9 +80,13 @@ struct Embedded {
 /// The outcome of matching a Horizon payment against a pending intent.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// Paid the full amount (or more) — mark the intent completed.
+    /// Cumulative paid amount equals the requested amount exactly.
     Completed { tx_hash: String, paid_amount: String },
-    /// Paid, but less than requested — mark the intent failed.
+    /// Cumulative paid amount exceeds the requested amount.
+    /// The intent is fulfilled; `delta` is the excess the merchant should refund.
+    Overpaid { tx_hash: String, paid_amount: String },
+    /// Cumulative paid amount is still below the requested amount.
+    /// The intent remains open; `delta` is the shortfall still owed.
     Underpaid { tx_hash: String, paid_amount: String },
 }
 
@@ -82,9 +98,17 @@ impl HorizonPayment {
 
 /// Decide whether a Horizon payment satisfies a pending intent.
 ///
+/// `already_paid_stroops` is the cumulative amount already received for this
+/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
+///
 /// Returns `None` when the payment is unrelated (wrong type, destination, memo,
-/// or asset). When it matches, returns whether the amount was sufficient.
-pub fn verify(payment: &db::Payment, hp: &HorizonPayment, usdc_issuer: &str) -> Option<Verdict> {
+/// or asset). When it matches, returns the verdict for the cumulative total.
+pub fn verify(
+    payment: &db::Payment,
+    hp: &HorizonPayment,
+    usdc_issuer: &str,
+    already_paid_stroops: i64,
+) -> Option<Verdict> {
     if hp.kind != "payment" {
         return None;
     }
@@ -108,21 +132,27 @@ pub fn verify(payment: &db::Payment, hp: &HorizonPayment, usdc_issuer: &str) -> 
     }
 
     let raw_amount = hp.amount.as_deref()?;
-    let paid = money::parse_stroops(raw_amount)?;
+    let new_paid = money::parse_stroops(raw_amount)?;
     let expected = money::parse_stroops(&payment.amount)?;
+    let total_paid = already_paid_stroops + new_paid;
     let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
+    let paid_amount = money::stroops_to_string(total_paid);
 
-    if paid >= expected {
-        Some(Verdict::Completed {
-            tx_hash,
-            paid_amount: raw_amount.to_string(),
-        })
-    } else {
-        Some(Verdict::Underpaid {
-            tx_hash,
-            paid_amount: raw_amount.to_string(),
-        })
+    use std::cmp::Ordering;
+    match total_paid.cmp(&expected) {
+        Ordering::Equal => Some(Verdict::Completed { tx_hash, paid_amount }),
+        Ordering::Greater => Some(Verdict::Overpaid { tx_hash, paid_amount }),
+        Ordering::Less => Some(Verdict::Underpaid { tx_hash, paid_amount }),
     }
+}
+
+/// Compute the absolute difference between two amount strings as a display
+/// string. Returns `None` if either value fails to parse (should never happen
+/// for amounts we wrote ourselves).
+fn delta_str(a: &str, b: &str) -> Option<String> {
+    let va = money::parse_stroops(a)?;
+    let vb = money::parse_stroops(b)?;
+    Some(money::stroops_to_string((va - vb).abs()))
 }
 
 /// Fetch the most recent payments into `account` from Horizon, newest first,
@@ -176,52 +206,56 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         let Some(payment) = by_memo.get(memo) else {
             continue;
         };
-        if apply_verdict(state, payment, hp).await {
-            settled += 1;
+
+        // Skip transactions already recorded for this intent. This prevents
+        // double-counting the original underpayment tx on subsequent poll cycles.
+        let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
+        if payment.tx_hash.as_deref() == Some(hp_hash) {
+            continue;
+        }
+
+        // For underpaid intents, carry forward what has already been received.
+        let already_paid_stroops = payment
+            .paid_amount
+            .as_deref()
+            .and_then(money::parse_stroops)
+            .unwrap_or(0);
+
+        match verify(payment, hp, &state.config.usdc_issuer, already_paid_stroops) {
+            Some(Verdict::Completed { tx_hash, paid_amount }) => {
+                settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
+                settled += 1;
+            }
+            Some(Verdict::Overpaid { tx_hash, paid_amount }) => {
+                let delta = delta_str(&paid_amount, &payment.amount);
+                info!(
+                    payment_id = %payment.id,
+                    excess = %delta.as_deref().unwrap_or("?"),
+                    "overpayment — intent completed, excess should be refunded"
+                );
+                settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.overpaid", delta.as_deref()).await;
+                settled += 1;
+            }
+            Some(Verdict::Underpaid { tx_hash, paid_amount }) => {
+                let delta = delta_str(&payment.amount, &paid_amount);
+                warn!(
+                    payment_id = %payment.id,
+                    expected = %payment.amount,
+                    paid = %paid_amount,
+                    remaining = %delta.as_deref().unwrap_or("?"),
+                    "underpayment — intent remains open for a top-up"
+                );
+                settle(state, payment, "underpaid", &tx_hash, &paid_amount, "payment.underpaid", delta.as_deref()).await;
+                settled += 1;
+            }
+            None => {}
         }
     }
 
     Ok(settled)
 }
 
-/// Verify a single Horizon payment against `payment` and, if it satisfies the
-/// intent, persist the terminal status and fire its webhook. Returns whether
-/// the intent was settled. This is the one place [`verify`]'s verdict is acted
-/// on, shared by the poller and the stream listener.
-async fn apply_verdict(state: &Arc<AppState>, payment: &db::Payment, hp: &HorizonPayment) -> bool {
-    match verify(payment, hp, &state.config.usdc_issuer) {
-        Some(Verdict::Completed {
-            tx_hash,
-            paid_amount,
-        }) => {
-            settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.success").await;
-            true
-        }
-        Some(Verdict::Underpaid {
-            tx_hash,
-            paid_amount,
-        }) => {
-            warn!(payment_id = %payment.id, expected = %payment.amount, paid = %paid_amount, "underpayment");
-            settle(state, payment, "failed", &tx_hash, &paid_amount, "payment.failed").await;
-            true
-        }
-        None => false,
-    }
-}
-
-/// Reconcile one streamed Horizon payment: look up the pending intent matching
-/// its memo and settle it if the payment satisfies the intent. Unmatched or
-/// non-payment records are silently ignored, exactly as in the poller.
-async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<()> {
-    let Some(memo) = hp.memo() else { return Ok(()) };
-    let Some(payment) = db::find_pending_by_memo(&state.pool, memo).await? else {
-        return Ok(());
-    };
-    apply_verdict(state, &payment, hp).await;
-    Ok(())
-}
-
-/// Persist a terminal status for `payment` and fire its webhook.
+/// Persist a terminal or intermediate status for `payment` and fire its webhook.
 async fn settle(
     state: &Arc<AppState>,
     payment: &db::Payment,
@@ -229,6 +263,7 @@ async fn settle(
     tx_hash: &str,
     paid_amount: &str,
     event: &str,
+    delta: Option<&str>,
 ) {
     if let Err(e) =
         db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await
@@ -243,7 +278,7 @@ async fn settle(
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
-    webhook::dispatch(state, &settled, event).await;
+    webhook::dispatch(state, &settled, event, delta).await;
 }
 
 /// Background loop that polls Horizon on the configured interval until the
@@ -480,46 +515,88 @@ mod tests {
         let p = pending("XLM", "10.00");
         let hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, USDC_ISSUER),
+            verify(&p, &hp, USDC_ISSUER, 0),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
-                paid_amount: "10.0000000".into(),
+                paid_amount: "10".into(),
             })
         );
     }
 
     #[test]
-    fn overpayment_completes() {
+    fn overpayment_yields_overpaid_verdict() {
         let p = pending("XLM", "10");
         let hp = native_payment("12.5", "MEMO1234", "GGATEWAY");
-        assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER),
-            Some(Verdict::Completed { .. })
-        ));
+        assert_eq!(
+            verify(&p, &hp, USDC_ISSUER, 0),
+            Some(Verdict::Overpaid {
+                tx_hash: "TXHASH".into(),
+                paid_amount: "12.5".into(),
+            })
+        );
     }
 
     #[test]
-    fn underpayment_fails() {
+    fn underpayment_yields_underpaid_verdict() {
         let p = pending("XLM", "10");
         let hp = native_payment("9.9999999", "MEMO1234", "GGATEWAY");
+        assert_eq!(
+            verify(&p, &hp, USDC_ISSUER, 0),
+            Some(Verdict::Underpaid {
+                tx_hash: "TXHASH".into(),
+                paid_amount: "9.9999999".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn topup_completing_underpaid_intent() {
+        // First payment: 3 of 5 XLM — underpaid.
+        let p = pending("XLM", "5");
+        let hp1 = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER),
+            verify(&p, &hp1, USDC_ISSUER, 0),
             Some(Verdict::Underpaid { .. })
         ));
+
+        // Top-up: 2 XLM arrives; cumulative = 5 = expected — completes exactly.
+        let hp2 = native_payment("2.0000000", "MEMO1234", "GGATEWAY");
+        assert_eq!(
+            verify(&p, &hp2, USDC_ISSUER, 30_000_000),
+            Some(Verdict::Completed {
+                tx_hash: "TXHASH".into(),
+                paid_amount: "5".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn topup_overpaying_underpaid_intent() {
+        // First payment: 3 of 5 XLM — underpaid.
+        let p = pending("XLM", "5");
+        // Top-up of 3 XLM; cumulative = 6 > 5 — overpaid.
+        let hp = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
+        assert_eq!(
+            verify(&p, &hp, USDC_ISSUER, 30_000_000),
+            Some(Verdict::Overpaid {
+                tx_hash: "TXHASH".into(),
+                paid_amount: "6".into(),
+            })
+        );
     }
 
     #[test]
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
+        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
     }
 
     #[test]
     fn wrong_destination_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "MEMO1234", "GSOMEONEELSE");
-        assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
+        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
     }
 
     #[test]
@@ -529,7 +606,7 @@ mod tests {
         hp.asset_type = Some("credit_alphanum4".into());
         hp.asset_code = Some("USDC".into());
         hp.asset_issuer = Some(USDC_ISSUER.into());
-        assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
+        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
     }
 
     #[test]
@@ -549,7 +626,7 @@ mod tests {
             }),
         };
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER),
+            verify(&p, &hp, USDC_ISSUER, 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -570,10 +647,10 @@ mod tests {
                 memo_type: Some("text".into()),
             }),
         };
-        assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
+        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
         // Sanity: with the right issuer it would have matched.
         hp.asset_issuer = Some(USDC_ISSUER.into());
-        assert!(verify(&p, &hp, USDC_ISSUER).is_some());
+        assert!(verify(&p, &hp, USDC_ISSUER, 0).is_some());
     }
 
     #[test]
@@ -581,7 +658,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
-        assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
+        assert_eq!(verify(&p, &hp, USDC_ISSUER, 0), None);
     }
 
     #[test]

@@ -208,11 +208,14 @@ pub async fn list_payments(
 
 /// All payments still awaiting confirmation, oldest first. Used by the Horizon
 /// poller to decide which memos to watch for on-chain.
+///
+/// Includes both `pending` (no payment yet) and `underpaid` (partial payment
+/// received, awaiting a top-up to reach the full amount).
 pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     let rows = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at
-         FROM payments WHERE status = 'pending' ORDER BY created_at ASC",
+         FROM payments WHERE status IN ('pending', 'underpaid') ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await?;
