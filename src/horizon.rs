@@ -111,8 +111,23 @@ pub enum Verdict {
 }
 
 impl HorizonPayment {
+    /// The transaction's memo, but only when Horizon reports it as `memo_type:
+    /// "text"`.
+    ///
+    /// We generate text memos exclusively (see [`crate::api::payments`]).
+    /// Stellar transactions can instead carry a `memo_id` (u64) or
+    /// `memo_hash`/`memo_return` (32-byte) memo, and Horizon still populates
+    /// the JSON `memo` field for those — as a decimal string or base64,
+    /// respectively. A `memo_id` consisting only of digits could coincide
+    /// with one of our hex memos as plain text, so the type must be checked;
+    /// otherwise an unrelated `memo_id` payment could be mistaken for one of
+    /// ours.
     fn memo(&self) -> Option<&str> {
-        self.transaction.as_ref().and_then(|t| t.memo.as_deref())
+        let t = self.transaction.as_ref()?;
+        if t.memo_type.as_deref() != Some("text") {
+            return None;
+        }
+        t.memo.as_deref()
     }
 }
 
@@ -759,6 +774,25 @@ mod tests {
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    /// A `memo_id`/`memo_hash`/`memo_return` transaction that happens to
+    /// render the same characters as one of our hex memos must never be
+    /// mistaken for a match — only `memo_type: "text"` counts.
+    #[test]
+    fn non_text_memo_type_is_ignored_even_if_value_matches() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().memo_type = Some("id".into());
+        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    #[test]
+    fn missing_memo_type_is_ignored() {
+        let p = pending("XLM", "10");
+        let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
+        hp.transaction.as_mut().unwrap().memo_type = None;
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
     }
 
