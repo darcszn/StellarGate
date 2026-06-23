@@ -120,8 +120,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     }
 
     warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
-    let _ =
-        db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
+    let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
 }
 
 #[cfg(test)]

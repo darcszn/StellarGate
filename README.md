@@ -148,7 +148,13 @@ Create a new payment intent.
 | `merchant_id` | string | ❌ | Any string |
 | `webhook_url` | string | ❌ | Valid HTTPS URL |
 
-**Response** `201 Created`
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `Idempotency-Key` | ❌ | Opaque client-chosen key for safe retries. Reusing a key (scoped per `merchant_id`) returns the original payment with `200 OK` instead of minting a duplicate intent. |
+
+**Response** `201 Created` (or `200 OK` when an `Idempotency-Key` matches a prior request)
 ```json
 {
   "id": "a1b2c3d4-...",

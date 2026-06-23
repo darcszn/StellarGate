@@ -92,13 +92,22 @@ struct Embedded {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// Cumulative paid amount equals the requested amount exactly.
-    Completed { tx_hash: String, paid_amount: String },
+    Completed {
+        tx_hash: String,
+        paid_amount: String,
+    },
     /// Cumulative paid amount exceeds the requested amount.
     /// The intent is fulfilled; `delta` is the excess the merchant should refund.
-    Overpaid { tx_hash: String, paid_amount: String },
+    Overpaid {
+        tx_hash: String,
+        paid_amount: String,
+    },
     /// Cumulative paid amount is still below the requested amount.
     /// The intent remains open; `delta` is the shortfall still owed.
-    Underpaid { tx_hash: String, paid_amount: String },
+    Underpaid {
+        tx_hash: String,
+        paid_amount: String,
+    },
 }
 
 impl HorizonPayment {
@@ -155,9 +164,18 @@ pub fn verify(
 
     use std::cmp::Ordering;
     match total_paid.cmp(&expected) {
-        Ordering::Equal => Some(Verdict::Completed { tx_hash, paid_amount }),
-        Ordering::Greater => Some(Verdict::Overpaid { tx_hash, paid_amount }),
-        Ordering::Less => Some(Verdict::Underpaid { tx_hash, paid_amount }),
+        Ordering::Equal => Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Greater => Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }),
+        Ordering::Less => Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }),
     }
 }
 
@@ -223,7 +241,12 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
         .json()
         .await?;
 
-    match page.embedded.records.first().and_then(|p| p.paging_token.clone()) {
+    match page
+        .embedded
+        .records
+        .first()
+        .and_then(|p| p.paging_token.clone())
+    {
         Some(token) => {
             // Persist immediately so a crash before the first page still leaves
             // us baselined rather than replaying history next time.
@@ -308,22 +331,54 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
         .and_then(money::parse_stroops)
         .unwrap_or(0);
 
-    match verify(&payment, hp, &state.config.usdc_issuer, already_paid_stroops) {
-        Some(Verdict::Completed { tx_hash, paid_amount }) => {
-            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
+    match verify(
+        &payment,
+        hp,
+        &state.config.accepted_assets,
+        already_paid_stroops,
+    ) {
+        Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }) => {
+            settle(
+                state,
+                &payment,
+                "completed",
+                &tx_hash,
+                &paid_amount,
+                "payment.completed",
+                None,
+            )
+            .await;
             Ok(true)
         }
-        Some(Verdict::Overpaid { tx_hash, paid_amount }) => {
+        Some(Verdict::Overpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
             let delta = delta_str(&paid_amount, &payment.amount);
             info!(
                 payment_id = %payment.id,
                 excess = %delta.as_deref().unwrap_or("?"),
                 "overpayment — intent completed, excess should be refunded"
             );
-            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.overpaid", delta.as_deref()).await;
+            settle(
+                state,
+                &payment,
+                "completed",
+                &tx_hash,
+                &paid_amount,
+                "payment.overpaid",
+                delta.as_deref(),
+            )
+            .await;
             Ok(true)
         }
-        Some(Verdict::Underpaid { tx_hash, paid_amount }) => {
+        Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
             let delta = delta_str(&payment.amount, &paid_amount);
             warn!(
                 payment_id = %payment.id,
@@ -332,7 +387,16 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 remaining = %delta.as_deref().unwrap_or("?"),
                 "underpayment — intent remains open for a top-up"
             );
-            settle(state, &payment, "underpaid", &tx_hash, &paid_amount, "payment.underpaid", delta.as_deref()).await;
+            settle(
+                state,
+                &payment,
+                "underpaid",
+                &tx_hash,
+                &paid_amount,
+                "payment.underpaid",
+                delta.as_deref(),
+            )
+            .await;
             Ok(true)
         }
         None => Ok(false),
@@ -810,7 +874,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, USDC_ISSUER, 0),
+            verify(&p, &hp, &test_assets(), 0),
             Some(Verdict::Completed { .. })
         ));
     }

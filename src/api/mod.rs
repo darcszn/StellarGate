@@ -1,14 +1,16 @@
 use crate::{db, AppState};
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Request,
+    Json,
 };
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tower_http::{
     cors::CorsLayer,
@@ -22,18 +24,35 @@ mod payments;
 /// Reject request bodies larger than this (256 KiB) before they hit a handler.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
+/// Per-client-IP rate limiter, shared across every request handled by a single
+/// router instance. Cloning is cheap — it shares the underlying limiter.
+#[derive(Clone)]
+struct RateLimit(Arc<DefaultKeyedRateLimiter<IpAddr>>);
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
-    let rate_limit_rps = state.config.rate_limit_requests_per_sec;
-    
+    let rps = state.config.rate_limit_requests_per_sec.max(1);
+    let quota = Quota::per_second(NonZeroU32::new(rps).unwrap());
+    let rate_limit = RateLimit(Arc::new(RateLimiter::keyed(quota)));
+
     axum::Router::new()
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/payments", post(payments::create).get(payments::list))
-        .route("/payments/:id", get(payments::get_by_id))
-        .route("/payments/:id/webhooks", get(payments::list_webhooks))
-        .route("/payments/:id/webhooks/:delivery_id/redeliver", post(payments::redeliver_webhook))
+        .nest("/payments", {
+            axum::Router::new()
+                .route("/", post(payments::create).get(payments::list))
+                .route("/:id", get(payments::get_by_id))
+                .route("/:id/webhooks", get(payments::list_webhooks))
+                .route(
+                    "/:id/webhooks/:delivery_id/redeliver",
+                    post(payments::redeliver_webhook),
+                )
+                .layer(middleware::from_fn_with_state(
+                    rate_limit,
+                    rate_limit_middleware,
+                ))
+        })
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
@@ -44,41 +63,35 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
 }
 
 async fn rate_limit_middleware(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    rate_limit_rps: u32,
+    State(rate_limit): State<RateLimit>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
     req: Request,
     next: Next,
-) -> axum::response::Response {
-    static LIMITERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, governor::RateLimiter>>> = std::sync::OnceLock::new();
-    
-    let limiters = LIMITERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let ip = addr.ip().to_string();
-    
-    let mut map = limiters.lock().unwrap();
-    let limiter = map.entry(ip).or_insert_with(|| {
-        governor::RateLimiter::direct(
-            governor::Quota::per_second(
-                std::num::NonZeroU32::new(rate_limit_rps).unwrap()
-            )
-        )
-    });
-    
-    if limiter.check().is_err() {
-        let retry_after = (1000 / rate_limit_rps).max(1);
+) -> Response {
+    // Key on the peer IP. When the server is started without connect-info (or
+    // under axum-test, which provides none), fall back to a shared key so the
+    // limiter still functions rather than rejecting or panicking.
+    let ip = connect_info
+        .map(|ConnectInfo(addr)| addr.ip())
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+
+    if rate_limit.0.check_key(&ip).is_err() {
+        // The per-second quota refills within one second, so asking the client
+        // to wait a single second is always sufficient.
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(
                 axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                axum::http::HeaderValue::from_static("1"),
             )],
-            axum::Json(json!({
+            Json(json!({
                 "error": "rate limit exceeded",
                 "code": "rate_limit_exceeded"
             })),
         )
             .into_response();
     }
-    
+
     next.run(req).await
 }
 
@@ -98,10 +111,8 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
         return CorsLayer::permissive();
     }
 
-    let allow_origins: Vec<axum::http::HeaderValue> = origins
-        .iter()
-        .filter_map(|o| o.parse().ok())
-        .collect();
+    let allow_origins: Vec<axum::http::HeaderValue> =
+        origins.iter().filter_map(|o| o.parse().ok()).collect();
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(allow_origins))
@@ -123,7 +134,11 @@ async fn health() -> impl IntoResponse {
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match db::ping(&state.pool).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "status": "unavailable" }))).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable" })),
+        )
+            .into_response(),
     }
 }
 

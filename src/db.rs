@@ -108,6 +108,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Idempotency keys for payment creation. A key is unique per merchant and
+    // maps to the payment id minted for the first request that used it, so a
+    // client retrying after a network blip gets the original payment back
+    // instead of a duplicate intent.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS idempotency_keys (
+            merchant_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            payment_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            PRIMARY KEY (merchant_id, idempotency_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Normalise legacy rows that were written by the old datetime('now') default,
     // which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
     // startup — the WHERE clause skips rows that are already RFC 3339.
@@ -201,6 +217,50 @@ pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
         .ok_or_else(|| anyhow::anyhow!("Payment not found after insert"))
 }
 
+/// Look up the payment id previously minted for `(merchant_id, key)`, if any.
+pub async fn find_payment_id_by_idempotency_key(
+    pool: &Db,
+    merchant_id: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let id: Option<String> = sqlx::query_scalar(
+        "SELECT payment_id FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?",
+    )
+    .bind(merchant_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Record the payment id minted for `(merchant_id, key)`. If the key already
+/// exists (e.g. a concurrent request won the race), the existing mapping is left
+/// untouched and the winning payment id is returned; otherwise `payment_id` is
+/// stored and returned.
+pub async fn save_idempotency_key(
+    pool: &Db,
+    merchant_id: &str,
+    key: &str,
+    payment_id: &str,
+) -> Result<String> {
+    sqlx::query(
+        "INSERT INTO idempotency_keys (merchant_id, idempotency_key, payment_id)
+         VALUES (?, ?, ?)
+         ON CONFLICT(merchant_id, idempotency_key) DO NOTHING",
+    )
+    .bind(merchant_id)
+    .bind(key)
+    .bind(payment_id)
+    .execute(pool)
+    .await?;
+
+    // Re-read so a concurrent insert that won the race returns the canonical id.
+    let stored = find_payment_id_by_idempotency_key(pool, merchant_id, key)
+        .await?
+        .unwrap_or_else(|| payment_id.to_string());
+    Ok(stored)
+}
+
 pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
     let row = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
@@ -266,53 +326,61 @@ pub async fn list_payments_keyset(
     cursor: Option<(&str, &str)>,
 ) -> Result<Vec<Payment>> {
     let rows = match (status, cursor) {
-        (None, None) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-        (None, Some((ts, cid))) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (None, Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(ts)
-        .bind(ts)
-        .bind(cid)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-        (Some(s), None) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (Some(s), None) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(s)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
 
-        (Some(s), Some((ts, cid))) => sqlx::query(
-            "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
+        (Some(s), Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
              WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(s)
-        .bind(ts)
-        .bind(ts)
-        .bind(cid)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(s)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
     };
 
     Ok(rows.iter().map(row_to_payment).collect())
@@ -461,7 +529,12 @@ pub async fn save_webhook_delivery(
     Ok(())
 }
 
-pub async fn update_webhook_delivery(pool: &Db, id: &str, status: &str, attempts: i64) -> Result<()> {
+pub async fn update_webhook_delivery(
+    pool: &Db,
+    id: &str,
+    status: &str,
+    attempts: i64,
+) -> Result<()> {
     sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
@@ -527,7 +600,9 @@ pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookD
 /// Probe database connectivity. Returns `Ok(())` if the pool can execute a
 /// trivial query, or `Err` if the database is unreachable.
 pub async fn ping(pool: &Db) -> Result<()> {
-    sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(pool).await?;
+    sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(pool)
+        .await?;
     Ok(())
 }
 
@@ -608,7 +683,10 @@ mod tests {
         let fetched = get_payment(&pool, "dead").await.unwrap().unwrap();
         assert_eq!(fetched.status, "expired");
         // The live intent is untouched.
-        assert_eq!(get_payment(&pool, "live").await.unwrap().unwrap().status, "pending");
+        assert_eq!(
+            get_payment(&pool, "live").await.unwrap().unwrap().status,
+            "pending"
+        );
 
         // A second sweep is a no-op — nothing is double-reported.
         assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
