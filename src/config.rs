@@ -36,7 +36,7 @@ pub struct AcceptedAsset {
 }
 
 impl AcceptedAsset {
-    fn parse_list(raw: &str) -> Vec<Self> {
+    pub(crate) fn parse_list(raw: &str) -> Vec<Self> {
         raw.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -85,11 +85,19 @@ pub struct Config {
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
     pub poll_interval_secs: u64,
-    /// Rate limit for POST /payments, counted per client key.
-    pub rate_limit_requests_per_sec: u32,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
+    /// Maximum number of requests per second allowed per client IP before the
+    /// rate-limit middleware responds with `429 Too Many Requests`.
+    pub rate_limit_requests_per_sec: u32,
+    /// Maximum number of SQLite connections in the pool.
+    /// WAL mode allows one writer + many readers, so keeping this modest avoids
+    /// contention. Defaults to 10.
+    pub db_pool_max_connections: u32,
+    /// How long (ms) SQLite waits for a lock before returning SQLITE_BUSY.
+    /// Must be > 0 to avoid immediate lock errors under concurrent writes.
+    pub db_busy_timeout_ms: u64,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -98,7 +106,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        Ok(Self {
+        let config = Self {
             port: parse_env("PORT", 3000),
             database_url: env_or("DATABASE_URL", "sqlite:stellargate.db"),
             network: env_or("STELLAR_NETWORK", "testnet"),
@@ -117,8 +125,10 @@ impl Config {
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
-            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
+            db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10),
+            db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -129,13 +139,42 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
-        })
+        };
+        config.validate_addresses()?;
+        Ok(config)
     }
 
     /// True once a real gateway wallet has been configured. Until then the
     /// Horizon poller stays idle rather than scanning the placeholder account.
     pub fn gateway_configured(&self) -> bool {
         !self.gateway_public.is_empty() && self.gateway_public != "UNCONFIGURED"
+    }
+
+    /// Reject configured Stellar addresses — the gateway account and any asset
+    /// issuers — that are not valid strkeys, so a typo fails fast at boot rather
+    /// than silently producing unpayable intents. The unconfigured placeholder
+    /// is left alone; the poller stays idle until a real key is provided.
+    fn validate_addresses(&self) -> Result<()> {
+        if self.gateway_configured() {
+            crate::strkey::validate_account_id(&self.gateway_public).map_err(|e| {
+                anyhow::anyhow!(
+                    "STELLAR_GATEWAY_PUBLIC ({}) is not a valid Stellar account address: {e}",
+                    self.gateway_public
+                )
+            })?;
+        }
+        for asset in &self.accepted_assets {
+            if let Some(issuer) = &asset.issuer {
+                crate::strkey::validate_account_id(issuer).map_err(|e| {
+                    anyhow::anyhow!(
+                        "issuer for asset {} ({}) is not a valid Stellar account address: {e}",
+                        asset.code,
+                        issuer
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -153,13 +192,35 @@ impl std::fmt::Debug for Config {
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
                 "rate_limit_requests_per_sec",
                 &self.rate_limit_requests_per_sec,
             )
+            .field("db_pool_max_connections", &self.db_pool_max_connections)
+            .field("db_busy_timeout_ms", &self.db_busy_timeout_ms)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
             .finish()
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse an env var into `T`, falling back to `default` (and warning) when the
+/// variable is set but unparseable, so a typo never silently breaks behaviour.
+fn parse_env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    match std::env::var(key) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            tracing::warn!("invalid value for {key}={raw:?}, using default");
+            default
+        }),
+        Err(_) => default,
     }
 }
 
@@ -181,8 +242,10 @@ mod tests {
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             poll_interval_secs: 10,
-            rate_limit_requests_per_sec: 10,
             payment_ttl_secs: 3600,
+            rate_limit_requests_per_sec: 10,
+            db_pool_max_connections: 10,
+            db_busy_timeout_ms: 5000,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
         };
@@ -227,23 +290,59 @@ mod tests {
             }
         );
     }
-}
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
+    fn sample_config() -> Config {
+        Config {
+            port: 3000,
+            database_url: "sqlite::memory:".into(),
+            network: "testnet".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            gateway_public: "UNCONFIGURED".into(),
+            gateway_secret: String::new(),
+            accepted_assets: AcceptedAsset::default_list(),
+            webhook_secret: String::new(),
+            webhook_retry_attempts: 3,
+            webhook_retry_delay_ms: 5000,
+            poll_interval_secs: 10,
+            payment_ttl_secs: 3600,
+            rate_limit_requests_per_sec: 10,
+            db_pool_max_connections: 10,
+            db_busy_timeout_ms: 5000,
+            cors_allowed_origins: vec![],
+            listener_mode: ListenerMode::Stream,
+        }
+    }
 
-/// Parse an env var into `T`, falling back to `default` (and warning) when the
-/// variable is set but unparseable, so a typo never silently breaks behaviour.
-fn parse_env<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
-    match std::env::var(key) {
-        Ok(raw) => raw.parse().unwrap_or_else(|_| {
-            tracing::warn!("invalid value for {key}={raw:?}, using default");
-            default
-        }),
-        Err(_) => default,
+    #[test]
+    fn validate_addresses_passes_for_unconfigured_gateway_and_default_issuer() {
+        // The placeholder gateway is skipped; the default USDC issuer is valid.
+        assert!(sample_config().validate_addresses().is_ok());
+    }
+
+    #[test]
+    fn validate_addresses_accepts_a_real_gateway_key() {
+        let mut cfg = sample_config();
+        cfg.gateway_public = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into();
+        assert!(cfg.validate_addresses().is_ok());
+    }
+
+    #[test]
+    fn validate_addresses_rejects_a_corrupted_gateway_key() {
+        let mut cfg = sample_config();
+        // A valid key with one character flipped — a realistic typo.
+        cfg.gateway_public = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLB5".into();
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("STELLAR_GATEWAY_PUBLIC"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_addresses_rejects_an_invalid_issuer() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![AcceptedAsset {
+            code: "USDC".into(),
+            issuer: Some("GNOTAREALISSUER".into()),
+        }];
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("USDC"), "got: {err}");
     }
 }

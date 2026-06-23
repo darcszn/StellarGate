@@ -29,7 +29,7 @@ This project is under active development. The following is implemented:
 - [x] Input validation (asset, amount as exact stroops, webhook URL)
 - [x] Transaction listener (Horizon SSE streaming + interval polling)
 - [x] Payment verification (memo + asset + amount)
-- [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
+- [x] Webhook dispatch (timestamped HMAC-SHA256 signature, replay-resistant, with retries)
 - [x] Multi-merchant support (`merchant_id` per payment)
 - [x] Pending-intent expiry (configurable TTL + `payment.expired` webhook)
 - [ ] Horizon streaming (currently polled on an interval)
@@ -67,9 +67,9 @@ cp .env.example .env
 | `DATABASE_URL` | sqlx connection string | `sqlite:stellargate.db` |
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet |
-| `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
+| `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key (`G...`). Validated as a Stellar strkey at startup; an invalid value aborts boot. | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
-| `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. | `XLM,USDC:<testnet-issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated assets to accept. Format: `CODE` for native (e.g. `XLM`) or `CODE:ISSUER` for non-native (e.g. `USDC:GISSUER`). Adding an asset is config-only — no code changes needed. Each `ISSUER` is validated as a Stellar strkey at startup. | `XLM,USDC:<testnet-issuer>` |
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `PAYMENT_TTL_SECS` | How long a payment intent stays `pending` before it is expired (from `created_at`) | `3600` |
@@ -78,6 +78,8 @@ cp .env.example .env
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` (requests per second per IP) | `10` |
+| `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
+| `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
 
 > `DATABASE_URL` is a sqlx connection string (`sqlite:stellargate.db`), not a
 > file path. The Horizon poller stays idle until `STELLAR_GATEWAY_PUBLIC` is set.
@@ -148,7 +150,13 @@ Create a new payment intent.
 | `merchant_id` | string | ❌ | Any string |
 | `webhook_url` | string | ❌ | Valid HTTPS URL |
 
-**Response** `201 Created`
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `Idempotency-Key` | ❌ | Opaque client-chosen key for safe retries. Reusing a key (scoped per `merchant_id`) returns the original payment with `200 OK` instead of minting a duplicate intent. |
+
+**Response** `201 Created` (or `200 OK` when an `Idempotency-Key` matches a prior request)
 ```json
 {
   "id": "a1b2c3d4-...",
@@ -331,17 +339,60 @@ verification failed), and `payment.expired` (the intent's TTL elapsed before
 payment arrived). The `event` field carries the type; `status` carries the
 matching payment status.
 
-Webhooks are signed with `X-StellarGate-Signature` (HMAC-SHA256) so you can verify authenticity.
+### Verifying webhooks
+
+Every webhook request carries two headers:
+
+| Header | Value |
+|---|---|
+| `X-StellarGate-Timestamp` | Unix time (seconds) at which the event was signed |
+| `X-StellarGate-Signature` | Hex HMAC-SHA256 of `"{timestamp}.{raw_body}"`, keyed with your `WEBHOOK_SECRET` |
+
+The signature covers the timestamp as well as the body (Stripe-style), so a
+captured request cannot be replayed indefinitely. To verify:
+
+1. Read `X-StellarGate-Timestamp` (`t`) and `X-StellarGate-Signature` (`sig`).
+2. Reject the request if `t` is too old: `abs(now - t) > tolerance`. A
+   **5-minute** tolerance is recommended — large enough for clock skew and
+   network delay, small enough to bound the replay window.
+3. Concatenate `"{t}.{raw_body}"` using the **exact bytes** received (verify
+   before any JSON re-encoding, which would change the bytes).
+4. Compute `HMAC_SHA256(WEBHOOK_SECRET, "{t}.{raw_body}")` and hex-encode it.
+5. Compare it to `sig` with a **constant-time** equality check. Reject on
+   mismatch.
+
+Example (Node.js):
+
+```js
+const crypto = require("crypto");
+
+function verify(rawBody, headers, secret, toleranceSec = 300) {
+  const t = Number(headers["x-stellargate-timestamp"]);
+  const sig = headers["x-stellargate-signature"];
+  if (!Number.isFinite(t) || Math.abs(Date.now() / 1000 - t) > toleranceSec) {
+    return false; // stale or missing timestamp — reject
+  }
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(`${t}.${rawBody}`)
+    .digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+```
 
 ## Project Structure
 
 ```
+migrations/
+└── 0001_initial_schema.sql   # Versioned schema applied automatically on startup
+
 src/
 ├── main.rs          # Entry point, server startup, listener/poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database queries (SQLite)
 ├── money.rs         # Stroops-based amount parsing/validation
+├── strkey.rs        # Stellar address (strkey) validation
 ├── horizon.rs       # Horizon polling listener + payment verification
 ├── expiry.rs        # Background sweeper that expires overdue pending intents
 ├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
@@ -352,6 +403,18 @@ src/
 tests/
 └── api_tests.rs     # Integration tests
 ```
+
+## Database Migrations
+
+Schema is managed with [`sqlx::migrate!`](https://docs.rs/sqlx/latest/sqlx/macro.migrate.html). Migrations live in `migrations/` as numbered SQL files and are applied automatically on startup — both a fresh database and an existing one converge to the same schema.
+
+**Adding a migration:**
+
+1. Create `migrations/<next_number>_<short_description>.sql` (e.g. `0002_add_refunds_table.sql`).
+2. Write your `ALTER TABLE` / `CREATE TABLE` SQL in the file.
+3. Run `cargo test` — the test suite boots against an in-memory database and will apply all migrations, catching syntax errors early.
+
+sqlx records applied migrations in a `_sqlx_migrations` table so each file is run exactly once.
 
 ## Contributing
 

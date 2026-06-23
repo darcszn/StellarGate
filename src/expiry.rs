@@ -12,6 +12,7 @@
 use crate::{db, webhook, AppState};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 /// The webhook event emitted when an intent is swept to `expired`.
@@ -31,7 +32,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 
 /// Background loop that sweeps expired intents on the configured poll interval
 /// until the process shuts down.
-pub async fn run_sweeper(state: Arc<AppState>) {
+pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
     info!(
         ttl_secs = state.config.payment_ttl_secs,
@@ -40,7 +41,13 @@ pub async fn run_sweeper(state: Arc<AppState>) {
     );
 
     loop {
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                info!("expiry sweeper shutting down");
+                return;
+            }
+        }
         match sweep_once(&state).await {
             Ok(0) => debug!("sweep: nothing to expire"),
             Ok(n) => info!(expired = n, "sweep expired payments"),

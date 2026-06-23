@@ -34,8 +34,13 @@ jobs:
 
       # Fails the job if any dependency has a known RustSec advisory.
       # --deny warnings escalates unmaintained/unsound advisories to errors.
+      #
+      # RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`) is ignored: `rsa`
+      # is pulled in only via sqlx's unused MySQL backend (we enable the `sqlite`
+      # feature only), so the vulnerable code is never compiled. No fixed `rsa`
+      # release exists yet. Kept in sync with the ignore list in deny.toml.
       - name: Run cargo audit
-        run: cargo audit --deny warnings
+        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
 
   deny:
     name: cargo deny (licenses + advisories + bans)

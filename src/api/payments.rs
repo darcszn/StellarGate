@@ -1,8 +1,8 @@
-use crate::{db, money, AppState};
+use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
     async_trait,
-    extract::{FromRequest, Path, Query, Request, State},
-    http::StatusCode,
+    extract::{Extension, FromRequest, Path, Query, Request, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -20,7 +20,11 @@ pub struct AppError {
 
 impl AppError {
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
@@ -30,14 +34,22 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response()
+        (
+            self.status,
+            Json(json!({ "error": self.message, "code": self.code })),
+        )
+            .into_response()
     }
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         tracing::error!(error = %err, "internal error");
-        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "internal server error")
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "internal server error",
+        )
     }
 }
 
@@ -82,7 +94,6 @@ pub struct CreatePaymentRequest {
     pub amount: String,
     #[serde(default = "default_asset")]
     pub asset: String,
-    pub merchant_id: Option<String>,
     pub webhook_url: Option<String>,
 }
 
@@ -92,12 +103,18 @@ fn default_asset() -> String {
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    headers: HeaderMap,
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     let accepted = &state.config.accepted_assets;
     if !accepted.iter().any(|a| a.code == asset) {
-        let codes = accepted.iter().map(|a| a.code.as_str()).collect::<Vec<_>>().join(", ");
+        let codes = accepted
+            .iter()
+            .map(|a| a.code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(AppError::bad_request(
             "unsupported_asset",
             format!("unsupported asset '{}'; supported: {}", body.asset, codes),
@@ -111,7 +128,31 @@ pub async fn create(
     }
     if let Some(url) = &body.webhook_url {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(AppError::bad_request("invalid_webhook_url", "webhook_url must be an http(s) URL"));
+            return Err(AppError::bad_request(
+                "invalid_webhook_url",
+                "webhook_url must be an http(s) URL",
+            ));
+        }
+    }
+
+    // An optional Idempotency-Key lets a client safely retry a create after a
+    // network blip without minting a duplicate intent. Keys are scoped per
+    // merchant; an empty header value is treated as absent.
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+
+    // If we've already seen this key for this merchant, return the original
+    // payment with 200 instead of creating a new one.
+    if let Some(key) = idempotency_key {
+        if let Some(existing_id) =
+            db::find_payment_id_by_idempotency_key(&state.pool, &merchant_id, key).await?
+        {
+            if let Some(payment) = db::get_payment(&state.pool, &existing_id).await? {
+                return Ok((StatusCode::OK, Json(to_json(&payment))));
+            }
         }
     }
 
@@ -122,7 +163,7 @@ pub async fn create(
         &state.pool,
         db::NewPayment {
             id: &id,
-            merchant_id: body.merchant_id.as_deref().unwrap_or("anonymous"),
+            merchant_id: &merchant_id,
             destination_address: &state.config.gateway_public,
             memo: &memo,
             amount: &body.amount,
@@ -133,6 +174,18 @@ pub async fn create(
     )
     .await?;
 
+    // Persist the key → payment mapping. If a concurrent request won the race,
+    // `save_idempotency_key` returns the canonical id; return that payment so
+    // both retries converge on a single intent.
+    if let Some(key) = idempotency_key {
+        let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
+        if canonical_id != id {
+            if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
+                return Ok((StatusCode::OK, Json(to_json(&payment))));
+            }
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }
 
@@ -142,7 +195,11 @@ pub async fn get_by_id(
 ) -> Result<Json<Value>, AppError> {
     match db::get_payment(&state.pool, &id).await? {
         Some(p) => Ok(Json(to_json(&p))),
-        None => Err(AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found")),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "payment_not_found",
+            "payment not found",
+        )),
     }
 }
 
@@ -160,13 +217,18 @@ const VALID_STATUSES: [&str; 4] = ["pending", "completed", "failed", "expired"];
 
 pub async fn list(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     if let Some(s) = &q.status {
         if !VALID_STATUSES.contains(&s.as_str()) {
             return Err(AppError::bad_request(
                 "invalid_status",
-                format!("invalid status '{}'; valid: {}", s, VALID_STATUSES.join(", ")),
+                format!(
+                    "invalid status '{}'; valid: {}",
+                    s,
+                    VALID_STATUSES.join(", ")
+                ),
             ));
         }
     }
@@ -180,6 +242,7 @@ pub async fn list(
 
         let payments = db::list_payments_keyset(
             &state.pool,
+            &merchant_id,
             q.status.as_deref(),
             limit,
             Some((&cursor_ts, &cursor_id)),
@@ -200,8 +263,14 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
-        let (payments, total) =
-            db::list_payments(&state.pool, q.status.as_deref(), limit, offset).await?;
+        let (payments, total) = db::list_payments(
+            &state.pool,
+            &merchant_id,
+            q.status.as_deref(),
+            limit,
+            offset,
+        )
+        .await?;
 
         // Provide next_cursor to ease migration to keyset pagination.
         let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
@@ -227,6 +296,26 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
     Some((ts.to_string(), id.to_string()))
 }
 
+/// Generates an 8-character uppercase-hex `text` memo (32 bits of entropy,
+/// well within Stellar's 28-byte text memo limit) and confirms it hasn't been
+/// used by *any* payment intent before — `memo_exists` checks the entire
+/// `payments` table, not just pending ones, so a memo is never reused for the
+/// lifetime of the database. That makes the collision probability for a
+/// single call simply `rows-in-table / 2^32`, and the loop retries up to 10
+/// times before giving up; exhausting that before billions of payments exist
+/// is effectively impossible. If traffic ever approaches that scale, widen
+/// the memo (more hex chars, still under the 28-byte limit) rather than
+/// switching scheme.
+///
+/// We chose a `text` memo over `memo_id` (a u64) or `memo_hash`/`memo_return`
+/// (32-byte) because it's the simplest scheme that round-trips a
+/// human-legible reference through Horizon. The tradeoff: Horizon's JSON
+/// `memo` field also holds a string for those other memo types (a decimal
+/// string for `memo_id`, base64 for `memo_hash`/`memo_return`), and a
+/// `memo_id` consisting only of digits could coincidentally render as the
+/// same text as one of our hex memos. `horizon::HorizonPayment::memo()`
+/// guards against this by only matching when Horizon reports `memo_type:
+/// "text"` (see issue #17).
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
     for _ in 0..10 {
         let memo = Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase();
@@ -265,7 +354,13 @@ pub async fn list_webhooks(
     // Verify payment exists
     let payment = db::get_payment(&state.pool, &payment_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                "payment_not_found",
+                "payment not found",
+            )
+        })?;
 
     let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
 
@@ -289,27 +384,46 @@ pub async fn redeliver_webhook(
     // Verify payment exists
     db::get_payment(&state.pool, &payment_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                "payment_not_found",
+                "payment not found",
+            )
+        })?;
 
     // Get the delivery
     let delivery = db::get_webhook_delivery(&state.pool, &delivery_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "delivery_not_found", "delivery not found"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                "delivery_not_found",
+                "delivery not found",
+            )
+        })?;
 
     // Verify the delivery belongs to this payment
     if delivery.payment_id != payment_id {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "delivery_not_found", "delivery not found"));
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "delivery_not_found",
+            "delivery not found",
+        ));
     }
 
-    // Re-send using the original signed payload
+    // Re-send the original payload, re-signed with a fresh timestamp so the
+    // receiver's replay-tolerance window is measured from this redelivery.
     let payload_bytes = delivery.payload.as_bytes();
-    let signature = crate::webhook::sign(&state.config.webhook_secret, payload_bytes);
+    let timestamp = crate::webhook::current_timestamp();
+    let signature = crate::webhook::sign(&state.config.webhook_secret, timestamp, payload_bytes);
 
     let result = state
         .http
         .post(&delivery.url)
         .header("Content-Type", "application/json")
         .header("X-StellarGate-Signature", &signature)
+        .header("X-StellarGate-Timestamp", timestamp.to_string())
         .header("X-StellarGate-Event", "payment.completed")
         .body(delivery.payload.clone())
         .send()
@@ -320,11 +434,16 @@ pub async fn redeliver_webhook(
         _ => "failed",
     };
 
-    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1).await?;
+    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
+        .await?;
 
     if new_status == "delivered" {
         Ok(StatusCode::OK)
     } else {
-        Err(AppError::new(StatusCode::BAD_GATEWAY, "webhook_delivery_failed", "webhook delivery failed"))
+        Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "webhook_delivery_failed",
+            "webhook delivery failed",
+        ))
     }
 }

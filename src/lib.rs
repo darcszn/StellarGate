@@ -4,6 +4,7 @@ pub mod db;
 pub mod expiry;
 pub mod horizon;
 pub mod money;
+pub mod strkey;
 pub mod webhook;
 
 /// Shared application state handed to every request handler and the background

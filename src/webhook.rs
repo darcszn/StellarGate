@@ -1,26 +1,50 @@
 //! Outbound webhook delivery.
 //!
 //! When a payment reaches a terminal state we POST a signed JSON event to the
-//! merchant's `webhook_url`. The body is signed with HMAC-SHA256 over the exact
-//! bytes we send, and the hex digest is placed in `X-StellarGate-Signature` so
-//! the receiver can verify authenticity.
+//! merchant's `webhook_url`. To let receivers prove both authenticity and
+//! freshness, every request carries two headers:
+//!
+//! - `X-StellarGate-Timestamp`: the Unix time (seconds) the event was signed.
+//! - `X-StellarGate-Signature`: the hex HMAC-SHA256 of `"{timestamp}.{body}"`
+//!   (Stripe-style), keyed with the shared `WEBHOOK_SECRET`.
+//!
+//! Binding the signature to the timestamp stops a captured request from being
+//! replayed indefinitely: a receiver recomputes the signature over the same
+//! `"{timestamp}.{body}"` string and rejects timestamps that fall outside a
+//! small tolerance window. See the README "Verifying webhooks" section for the
+//! verification recipe and recommended window.
 
 use crate::{db, AppState};
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use sha2::Sha256;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Compute the hex-encoded HMAC-SHA256 signature for a webhook body.
-pub fn sign(secret: &str, body: &[u8]) -> String {
+/// Compute the hex-encoded HMAC-SHA256 signature for a webhook, binding it to
+/// `timestamp` by signing the Stripe-style payload `"{timestamp}.{body}"`.
+///
+/// Receivers must recompute the signature over the same `"{timestamp}.{body}"`
+/// string and reject the request if `timestamp` is too far from their own clock
+/// (see the README), which is what prevents replay of an old, valid signature.
+pub fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(timestamp.to_string().as_bytes());
+    mac.update(b".");
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// Current Unix time in seconds, used as the webhook signing timestamp.
+pub(crate) fn current_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Build the JSON event payload for a payment in a terminal state.
@@ -65,7 +89,8 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
             return;
         }
     };
-    let signature = sign(&state.config.webhook_secret, &body);
+    let timestamp = current_timestamp();
+    let signature = sign(&state.config.webhook_secret, timestamp, &body);
 
     let delivery_id = Uuid::new_v4().to_string();
     if let Err(e) = db::save_webhook_delivery(
@@ -89,6 +114,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
             .post(&url)
             .header("Content-Type", "application/json")
             .header("X-StellarGate-Signature", &signature)
+            .header("X-StellarGate-Timestamp", timestamp.to_string())
             .header("X-StellarGate-Event", event)
             .body(body.clone())
             .send()
@@ -120,8 +146,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     }
 
     warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
-    let _ =
-        db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
+    let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
 }
 
 #[cfg(test)]
@@ -129,18 +154,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signature_is_stable_and_keyed() {
-        // Known HMAC-SHA256 vector: key "key", message "The quick brown fox jumps over the lazy dog".
-        let sig = sign("key", b"The quick brown fox jumps over the lazy dog");
+    fn signature_is_deterministic() {
+        // Identical inputs always produce the same digest.
+        let body = b"{\"event\":\"payment.success\"}";
+        assert_eq!(
+            sign("key", 1_700_000_000, body),
+            sign("key", 1_700_000_000, body)
+        );
+    }
+
+    #[test]
+    fn signature_matches_known_vector() {
+        // Locks the Stripe-style signed payload format "{timestamp}.{body}".
+        // Independently reproducible:
+        //   printf '1700000000.{"id":"evt_1"}' | openssl dgst -sha256 -hmac whsec_test
+        let sig = sign("whsec_test", 1_700_000_000, br#"{"id":"evt_1"}"#);
         assert_eq!(
             sig,
-            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+            "c89214b5b5da833daed6f0b8c5bb6bd58cea9022bd80ccc78230f3942d632925"
+        );
+    }
+
+    #[test]
+    fn signature_covers_timestamp() {
+        // The whole point of the timestamp: changing only it changes the
+        // signature, so an old signature cannot be replayed with a fresh time.
+        let body = b"{\"event\":\"payment.completed\"}";
+        assert_ne!(
+            sign("secret", 1_700_000_000, body),
+            sign("secret", 1_700_000_001, body),
+            "changing only the timestamp must change the signature"
         );
     }
 
     #[test]
     fn signature_changes_with_secret() {
         let body = b"{\"event\":\"payment.success\"}";
-        assert_ne!(sign("secret-a", body), sign("secret-b", body));
+        assert_ne!(sign("secret-a", 1, body), sign("secret-b", 1, body));
     }
 }

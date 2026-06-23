@@ -2,6 +2,10 @@
 name = "stellargate"
 version = "0.1.0"
 edition = "2021"
+# Application binary, not a library published to crates.io. `publish = false`
+# lets cargo-deny skip it under `[licenses].private` rather than flagging the
+# (intentionally unlicensed) workspace crate itself.
+publish = false
 
 [[bin]]
 name = "stellargate"
@@ -14,7 +18,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "limit", "request-i
 governor = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls"] }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-native-tls", "migrate"] }
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
@@ -30,3 +34,4 @@ anyhow = "1"
 axum-test = "15"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
+wiremock = "0.6.5"
