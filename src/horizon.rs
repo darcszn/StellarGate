@@ -441,8 +441,11 @@ async fn settle(
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
+    // Webhook delivery is handled asynchronously by the webhook subsystem
+    // (recording here is non-blocking from reconciliation's point of view).
     webhook::dispatch(state, &settled, event, delta).await;
 }
+
 
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
