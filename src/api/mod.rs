@@ -5,7 +5,7 @@ use axum::{
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Json,
+    Extension, Json,
 };
 use serde_json::json;
 use std::net::SocketAddr;
@@ -22,6 +22,10 @@ mod payments;
 /// Reject request bodies larger than this (256 KiB) before they hit a handler.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 
+/// The authenticated merchant ID injected by the auth middleware.
+#[derive(Clone)]
+pub struct AuthenticatedMerchant(pub String);
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
     let rate_limit_rps = state.config.rate_limit_requests_per_sec;
@@ -30,9 +34,21 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        // Merchant provisioning — returns a one-time plaintext API key.
+        .route("/merchants", post(provision_merchant))
         .nest("/payments", {
-            axum::Router::new()
+            // Auth middleware only on the write + list routes; the per-payment
+            // status and webhook endpoints stay public (anyone with the id can
+            // poll or inspect).
+            let authed = axum::Router::new()
                 .route("/", post(payments::create).get(payments::list))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ));
+
+            axum::Router::new()
+                .merge(authed)
                 .route("/:id", get(payments::get_by_id))
                 .route("/:id/webhooks", get(payments::list_webhooks))
                 .route(
@@ -52,6 +68,74 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(cors)
         .with_state(state)
+}
+
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let raw_key = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string);
+
+    let Some(key) = raw_key else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid Authorization header", "code": "unauthorized" })),
+        )
+            .into_response();
+    };
+
+    match db::find_merchant_by_key(&state.pool, &key).await {
+        Ok(Some(merchant_id)) => {
+            req.extensions_mut()
+                .insert(AuthenticatedMerchant(merchant_id));
+            next.run(req).await
+        }
+        Ok(None) => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid API key", "code": "unauthorized" })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "internal server error", "code": "internal_error" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /merchants` — provision a new merchant and return its API key once.
+/// In production this endpoint should be protected (e.g., by an admin secret
+/// or removed entirely in favour of an offline provisioning script).
+async fn provision_merchant(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let merchant_id = uuid::Uuid::new_v4().to_string();
+    let raw_key = uuid::Uuid::new_v4().to_string();
+
+    db::create_merchant(&state.pool, &merchant_id, &raw_key)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "internal server error", "code": "internal_error" })),
+            )
+        })?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "merchant_id": merchant_id,
+            "api_key": raw_key,
+        })),
+    ))
 }
 
 async fn rate_limit_middleware(

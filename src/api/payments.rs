@@ -1,7 +1,7 @@
-use crate::{db, money, AppState};
+use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
     async_trait,
-    extract::{FromRequest, Path, Query, Request, State},
+    extract::{Extension, FromRequest, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -94,7 +94,6 @@ pub struct CreatePaymentRequest {
     pub amount: String,
     #[serde(default = "default_asset")]
     pub asset: String,
-    pub merchant_id: Option<String>,
     pub webhook_url: Option<String>,
 }
 
@@ -104,6 +103,7 @@ fn default_asset() -> String {
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     headers: HeaderMap,
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -135,8 +135,6 @@ pub async fn create(
         }
     }
 
-    let merchant_id = body.merchant_id.as_deref().unwrap_or("anonymous");
-
     // An optional Idempotency-Key lets a client safely retry a create after a
     // network blip without minting a duplicate intent. Keys are scoped per
     // merchant; an empty header value is treated as absent.
@@ -150,7 +148,7 @@ pub async fn create(
     // payment with 200 instead of creating a new one.
     if let Some(key) = idempotency_key {
         if let Some(existing_id) =
-            db::find_payment_id_by_idempotency_key(&state.pool, merchant_id, key).await?
+            db::find_payment_id_by_idempotency_key(&state.pool, &merchant_id, key).await?
         {
             if let Some(payment) = db::get_payment(&state.pool, &existing_id).await? {
                 return Ok((StatusCode::OK, Json(to_json(&payment))));
@@ -165,7 +163,7 @@ pub async fn create(
         &state.pool,
         db::NewPayment {
             id: &id,
-            merchant_id,
+            merchant_id: &merchant_id,
             destination_address: &state.config.gateway_public,
             memo: &memo,
             amount: &body.amount,
@@ -180,7 +178,7 @@ pub async fn create(
     // `save_idempotency_key` returns the canonical id; return that payment so
     // both retries converge on a single intent.
     if let Some(key) = idempotency_key {
-        let canonical_id = db::save_idempotency_key(&state.pool, merchant_id, key, &id).await?;
+        let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
         if canonical_id != id {
             if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
                 return Ok((StatusCode::OK, Json(to_json(&payment))));
@@ -219,6 +217,7 @@ const VALID_STATUSES: [&str; 4] = ["pending", "completed", "failed", "expired"];
 
 pub async fn list(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     if let Some(s) = &q.status {
@@ -243,6 +242,7 @@ pub async fn list(
 
         let payments = db::list_payments_keyset(
             &state.pool,
+            &merchant_id,
             q.status.as_deref(),
             limit,
             Some((&cursor_ts, &cursor_id)),
@@ -264,7 +264,7 @@ pub async fn list(
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
         let (payments, total) =
-            db::list_payments(&state.pool, q.status.as_deref(), limit, offset).await?;
+            db::list_payments(&state.pool, &merchant_id, q.status.as_deref(), limit, offset).await?;
 
         // Provide next_cursor to ease migration to keyset pagination.
         let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));

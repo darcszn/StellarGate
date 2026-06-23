@@ -24,7 +24,135 @@ fn normalize_ts(raw: &str) -> String {
 }
 
 pub async fn migrate(pool: &Db) -> Result<()> {
-    sqlx::migrate!("./migrations").run(pool).await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS payments (
+            id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL DEFAULT 'anonymous',
+            destination_address TEXT NOT NULL,
+            memo TEXT NOT NULL UNIQUE,
+            amount TEXT NOT NULL,
+            asset TEXT NOT NULL DEFAULT 'XLM',
+            status TEXT NOT NULL DEFAULT 'pending',
+            webhook_url TEXT,
+            tx_hash TEXT,
+            paid_amount TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Bring pre-existing payment tables up to schema. New databases already have
+    // `expires_at` from the CREATE TABLE above; older ones need it added in
+    // place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
+    // add it nullable and backfill below.
+    let has_expires_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_expires_at == 0 {
+        sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
+            .execute(pool)
+            .await?;
+    }
+    // Backfill any row without an expiry (legacy rows, or rows inserted in the
+    // brief window before the column existed). `created_at + 1h` mirrors the
+    // default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form.
+    sqlx::query(
+        "UPDATE payments
+            SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
+          WHERE expires_at IS NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            id TEXT PRIMARY KEY,
+            payment_id TEXT NOT NULL,
+            url TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Durable key/value state — used by the Horizon poller to persist its
+    // paging cursor so it resumes exactly where it left off across restarts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS kv_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Merchants are provisioned via POST /merchants. The raw API key is never
+    // stored; only its SHA-256 hex digest is persisted so a DB breach does not
+    // expose live credentials.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS merchants (
+            id TEXT PRIMARY KEY,
+            api_key_hash TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Idempotency keys for payment creation. A key is unique per merchant and
+    // maps to the payment id minted for the first request that used it, so a
+    // client retrying after a network blip gets the original payment back
+    // instead of a duplicate intent.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS idempotency_keys (
+            merchant_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            payment_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            PRIMARY KEY (merchant_id, idempotency_key)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Normalise legacy rows that were written by the old datetime('now') default,
+    // which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
+    // startup — the WHERE clause skips rows that are already RFC 3339.
+    for tbl_col in [
+        ("payments", "created_at"),
+        ("payments", "updated_at"),
+        ("webhook_deliveries", "created_at"),
+    ] {
+        let sql = format!(
+            "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
+            tbl_col.0,
+            col = tbl_col.1
+        );
+        sqlx::query(&sql).execute(pool).await?;
+    }
+
     Ok(())
 }
 
@@ -161,6 +289,7 @@ pub async fn get_payment(pool: &Db, id: &str) -> Result<Option<Payment>> {
 
 pub async fn list_payments(
     pool: &Db,
+    merchant_id: &str,
     status: Option<&str>,
     limit: i64,
     offset: i64,
@@ -169,15 +298,17 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(merchant_id)
         .bind(s)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE status = ?")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?")
+            .bind(merchant_id)
             .bind(s)
             .fetch_one(pool)
             .await?;
@@ -187,14 +318,16 @@ pub async fn list_payments(
         let rows = sqlx::query(
             "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments ORDER BY created_at DESC LIMIT ? OFFSET ?",
+             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(merchant_id)
         .bind(limit)
         .bind(offset)
         .fetch_all(pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ?")
+            .bind(merchant_id)
             .fetch_one(pool)
             .await?;
 
@@ -206,6 +339,7 @@ pub async fn list_payments(
 
 pub async fn list_payments_keyset(
     pool: &Db,
+    merchant_id: &str,
     status: Option<&str>,
     limit: i64,
     cursor: Option<(&str, &str)>,
@@ -215,8 +349,9 @@ pub async fn list_payments_keyset(
             sqlx::query(
                 "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments ORDER BY created_at DESC, id DESC LIMIT ?",
+             FROM payments WHERE merchant_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             )
+            .bind(merchant_id)
             .bind(limit)
             .fetch_all(pool)
             .await?
@@ -227,9 +362,10 @@ pub async fn list_payments_keyset(
                 "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
-             WHERE (created_at < ? OR (created_at = ? AND id < ?))
+             WHERE merchant_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
             )
+            .bind(merchant_id)
             .bind(ts)
             .bind(ts)
             .bind(cid)
@@ -242,8 +378,9 @@ pub async fn list_payments_keyset(
             sqlx::query(
                 "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-             FROM payments WHERE status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+             FROM payments WHERE merchant_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ?",
             )
+            .bind(merchant_id)
             .bind(s)
             .bind(limit)
             .fetch_all(pool)
@@ -255,9 +392,10 @@ pub async fn list_payments_keyset(
                 "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                     webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
              FROM payments
-             WHERE status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+             WHERE merchant_id = ? AND status = ? AND (created_at < ? OR (created_at = ? AND id < ?))
              ORDER BY created_at DESC, id DESC LIMIT ?",
             )
+            .bind(merchant_id)
             .bind(s)
             .bind(ts)
             .bind(ts)
@@ -491,6 +629,43 @@ pub async fn ping(pool: &Db) -> Result<()> {
         .fetch_one(pool)
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Merchant API-key management
+// ---------------------------------------------------------------------------
+
+/// Hash a raw API key with SHA-256, returning the hex digest.
+/// This is the only representation stored in the database.
+fn hash_api_key(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(raw.as_bytes()))
+}
+
+/// Create a merchant row. Returns the merchant `id` — the raw key must be
+/// shown to the user by the caller and is not recoverable afterward.
+pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str) -> Result<()> {
+    let hash = hash_api_key(raw_key);
+    sqlx::query(
+        "INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)",
+    )
+    .bind(id)
+    .bind(hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Look up a merchant by their raw API key. Returns `None` if the key does
+/// not match any registered merchant.
+pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<String>> {
+    let hash = hash_api_key(raw_key);
+    let id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM merchants WHERE api_key_hash = ?")
+            .bind(hash)
+            .fetch_optional(pool)
+            .await?;
+    Ok(id)
 }
 
 #[cfg(test)]
