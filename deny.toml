@@ -3,26 +3,30 @@
 
 # ── Advisories ────────────────────────────────────────────────────────────────
 # Mirrors the RustSec advisory database. cargo-deny fetches it automatically.
+# Schema version 2: vulnerabilities, unsound and yanked crates are denied by
+# default, so only the scope/ignore knobs need to be set explicitly.
 [advisories]
-# Treat any unignored vulnerability as a hard error.
-vulnerability = "deny"
-# Unmaintained crates are a supply-chain risk for a payments service.
-unmaintained = "deny"
-# Yanked versions should not be in a locked dependency tree.
-yanked = "deny"
-# Crates flagged for unsound usage patterns.
-unsound = "deny"
-# Notice-level advisories are informational; warn rather than fail.
-notice = "warn"
+version = 2
+# Check every crate in the tree (not just the workspace) for unmaintained
+# advisories — a supply-chain risk for a payments service.
+unmaintained = "all"
+# Advisories that are acknowledged and accepted, with justification.
+ignore = [
+    # RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`). `rsa` is pulled
+    # in only via sqlx's MySQL backend, which we do not enable — we depend on
+    # `sqlx` with the `sqlite` feature only, so the vulnerable code is never
+    # compiled or executed. No fixed `rsa` release is available yet.
+    "RUSTSEC-2023-0071",
+]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
+# Schema version 2: any crate whose license is not in `allow` (or covered by an
+# exception) is denied.
 [licenses]
-# Reject any crate whose license is not in the allow list below.
-unlicensed = "deny"
-# Crates that declare multiple licenses (e.g. MIT OR Apache-2.0) are allowed
-# as long as at least one option is in the list.
-allow-osi-fsf-free = "neither"
-
+version = 2
+# Skip the workspace's own unpublished crate (`publish = false`), which is
+# intentionally unlicensed; only third-party dependencies are license-checked.
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",
@@ -31,6 +35,7 @@ allow = [
     "BSD-3-Clause",
     "ISC",                             # used by some cryptography crates (ring deps)
     "Unicode-DFS-2016",                # unicode-ident, icu_* and related crates
+    "Unicode-3.0",                     # newer unicode-ident / icu_* releases
     "CC0-1.0",                         # public-domain data crates
     "Zlib",                            # miniz_oxide and compression crates
     "OpenSSL",                         # openssl-sys transitive dep via native-tls
@@ -51,10 +56,8 @@ name = "ring"
 # Warn when the same crate is resolved at multiple versions. Duplicates bloat
 # the binary and can mask version-sensitive security fixes.
 multiple-versions = "warn"
-# Deny crates that are known wildcards in the ecosystem.
+# Wildcard ("*") version requirements are allowed for now.
 wildcards = "allow"
-# Deny git-source dependencies not from crates.io (prevents shadow deps).
-allow-build-scripts = true
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 [sources]

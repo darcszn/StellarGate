@@ -2,7 +2,7 @@ use crate::{db, money, AppState};
 use axum::{
     async_trait,
     extract::{FromRequest, Path, Query, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -104,6 +104,7 @@ fn default_asset() -> String {
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
@@ -141,7 +142,7 @@ pub async fn create(
         &state.pool,
         db::NewPayment {
             id: &id,
-            merchant_id: body.merchant_id.as_deref().unwrap_or("anonymous"),
+            merchant_id,
             destination_address: &state.config.gateway_public,
             memo: &memo,
             amount: &body.amount,
@@ -151,6 +152,18 @@ pub async fn create(
         },
     )
     .await?;
+
+    // Persist the key → payment mapping. If a concurrent request won the race,
+    // `save_idempotency_key` returns the canonical id; return that payment so
+    // both retries converge on a single intent.
+    if let Some(key) = idempotency_key {
+        let canonical_id = db::save_idempotency_key(&state.pool, merchant_id, key, &id).await?;
+        if canonical_id != id {
+            if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
+                return Ok((StatusCode::OK, Json(to_json(&payment))));
+            }
+        }
+    }
 
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }

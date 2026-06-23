@@ -1,5 +1,6 @@
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,16 +37,22 @@ async fn main() -> Result<()> {
         http,
     });
 
+    // Broadcast shutdown to all background tasks.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Detect on-chain payments. In stream mode the SSE listener settles intents
     // in near real time while the poller runs alongside as a reconciler; in
     // poll mode only the interval poller runs.
-    if cfg.listener_mode == ListenerMode::Stream {
-        tokio::spawn(horizon::run_stream_listener(state.clone()));
-    }
-    tokio::spawn(horizon::run_poller(state.clone()));
-
-    // Background expiry of pending intents that pass their TTL.
-    tokio::spawn(expiry::run_sweeper(state.clone()));
+    let stream_handle = if cfg.listener_mode == ListenerMode::Stream {
+        Some(tokio::spawn(horizon::run_stream_listener(
+            state.clone(),
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
+    let poller_handle = tokio::spawn(horizon::run_poller(state.clone(), shutdown_rx.clone()));
+    let sweeper_handle = tokio::spawn(expiry::run_sweeper(state.clone(), shutdown_rx));
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

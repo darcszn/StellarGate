@@ -88,6 +88,9 @@ pub struct Config {
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
+    /// Maximum number of requests per second allowed per client IP before the
+    /// rate-limit middleware responds with `429 Too Many Requests`.
+    pub rate_limit_requests_per_sec: u32,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -118,6 +121,7 @@ impl Config {
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_RPS", 10),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -153,6 +157,11 @@ impl std::fmt::Debug for Config {
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("payment_ttl_secs", &self.payment_ttl_secs)
+            .field(
+                "rate_limit_requests_per_sec",
+                &self.rate_limit_requests_per_sec,
+            )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
             .field(
@@ -160,6 +169,25 @@ impl std::fmt::Debug for Config {
                 &self.rate_limit_requests_per_sec,
             )
             .finish()
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse an env var into `T`, falling back to `default` (and warning) when the
+/// variable is set but unparseable, so a typo never silently breaks behaviour.
+fn parse_env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    match std::env::var(key) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            tracing::warn!("invalid value for {key}={raw:?}, using default");
+            default
+        }),
+        Err(_) => default,
     }
 }
 
@@ -182,6 +210,7 @@ mod tests {
             webhook_retry_delay_ms: 5000,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
+            rate_limit_requests_per_sec: 10,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
             rate_limit_requests_per_sec: 10,

@@ -2,6 +2,10 @@
 name = "stellargate"
 version = "0.1.0"
 edition = "2021"
+# Application binary, not a library published to crates.io. `publish = false`
+# lets cargo-deny skip it under `[licenses].private` rather than flagging the
+# (intentionally unlicensed) workspace crate itself.
+publish = false
 
 [[bin]]
 name = "stellargate"

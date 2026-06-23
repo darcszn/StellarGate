@@ -3,12 +3,14 @@ use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json,
 };
+use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tower_http::{
     cors::CorsLayer,
@@ -21,6 +23,11 @@ mod payments;
 
 /// Reject request bodies larger than this (256 KiB) before they hit a handler.
 const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Per-client-IP rate limiter, shared across every request handled by a single
+/// router instance. Cloning is cheap — it shares the underlying limiter.
+#[derive(Clone)]
+struct RateLimit(Arc<DefaultKeyedRateLimiter<IpAddr>>);
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
@@ -85,9 +92,9 @@ async fn rate_limit_middleware(
             StatusCode::TOO_MANY_REQUESTS,
             [(
                 axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_str(&retry_after.to_string()).unwrap(),
+                axum::http::HeaderValue::from_static("1"),
             )],
-            axum::Json(json!({
+            Json(json!({
                 "error": "rate limit exceeded",
                 "code": "rate_limit_exceeded"
             })),
