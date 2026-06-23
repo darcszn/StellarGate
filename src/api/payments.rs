@@ -20,7 +20,11 @@ pub struct AppError {
 
 impl AppError {
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
@@ -30,14 +34,22 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message, "code": self.code }))).into_response()
+        (
+            self.status,
+            Json(json!({ "error": self.message, "code": self.code })),
+        )
+            .into_response()
     }
 }
 
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         tracing::error!(error = %err, "internal error");
-        AppError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", "internal server error")
+        AppError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "internal server error",
+        )
     }
 }
 
@@ -98,7 +110,11 @@ pub async fn create(
     let asset = body.asset.to_uppercase();
     let accepted = &state.config.accepted_assets;
     if !accepted.iter().any(|a| a.code == asset) {
-        let codes = accepted.iter().map(|a| a.code.as_str()).collect::<Vec<_>>().join(", ");
+        let codes = accepted
+            .iter()
+            .map(|a| a.code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(AppError::bad_request(
             "unsupported_asset",
             format!("unsupported asset '{}'; supported: {}", body.asset, codes),
@@ -112,7 +128,10 @@ pub async fn create(
     }
     if let Some(url) = &body.webhook_url {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(AppError::bad_request("invalid_webhook_url", "webhook_url must be an http(s) URL"));
+            return Err(AppError::bad_request(
+                "invalid_webhook_url",
+                "webhook_url must be an http(s) URL",
+            ));
         }
     }
 
@@ -178,7 +197,11 @@ pub async fn get_by_id(
 ) -> Result<Json<Value>, AppError> {
     match db::get_payment(&state.pool, &id).await? {
         Some(p) => Ok(Json(to_json(&p))),
-        None => Err(AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found")),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "payment_not_found",
+            "payment not found",
+        )),
     }
 }
 
@@ -202,7 +225,11 @@ pub async fn list(
         if !VALID_STATUSES.contains(&s.as_str()) {
             return Err(AppError::bad_request(
                 "invalid_status",
-                format!("invalid status '{}'; valid: {}", s, VALID_STATUSES.join(", ")),
+                format!(
+                    "invalid status '{}'; valid: {}",
+                    s,
+                    VALID_STATUSES.join(", ")
+                ),
             ));
         }
     }
@@ -301,7 +328,13 @@ pub async fn list_webhooks(
     // Verify payment exists
     let payment = db::get_payment(&state.pool, &payment_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                "payment_not_found",
+                "payment not found",
+            )
+        })?;
 
     let deliveries = db::list_webhook_deliveries(&state.pool, &payment_id).await?;
 
@@ -325,16 +358,32 @@ pub async fn redeliver_webhook(
     // Verify payment exists
     db::get_payment(&state.pool, &payment_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "payment_not_found", "payment not found"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                "payment_not_found",
+                "payment not found",
+            )
+        })?;
 
     // Get the delivery
     let delivery = db::get_webhook_delivery(&state.pool, &delivery_id)
         .await?
-        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, "delivery_not_found", "delivery not found"))?;
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                "delivery_not_found",
+                "delivery not found",
+            )
+        })?;
 
     // Verify the delivery belongs to this payment
     if delivery.payment_id != payment_id {
-        return Err(AppError::new(StatusCode::NOT_FOUND, "delivery_not_found", "delivery not found"));
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "delivery_not_found",
+            "delivery not found",
+        ));
     }
 
     // Re-send using the original signed payload
@@ -356,11 +405,16 @@ pub async fn redeliver_webhook(
         _ => "failed",
     };
 
-    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1).await?;
+    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
+        .await?;
 
     if new_status == "delivered" {
         Ok(StatusCode::OK)
     } else {
-        Err(AppError::new(StatusCode::BAD_GATEWAY, "webhook_delivery_failed", "webhook delivery failed"))
+        Err(AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "webhook_delivery_failed",
+            "webhook delivery failed",
+        ))
     }
 }

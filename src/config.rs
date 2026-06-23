@@ -36,7 +36,7 @@ pub struct AcceptedAsset {
 }
 
 impl AcceptedAsset {
-    fn parse_list(raw: &str) -> Vec<Self> {
+    pub(crate) fn parse_list(raw: &str) -> Vec<Self> {
         raw.split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -58,18 +58,19 @@ impl AcceptedAsset {
 
     pub fn default_list() -> Vec<Self> {
         vec![
-            AcceptedAsset { code: "XLM".into(), issuer: None },
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
             AcceptedAsset {
                 code: "USDC".into(),
-                issuer: Some(
-                    "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
-                ),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
             },
         ]
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub database_url: String,
@@ -87,6 +88,9 @@ pub struct Config {
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
+    /// Maximum number of requests per second allowed per client IP before the
+    /// rate-limit middleware responds with `429 Too Many Requests`.
+    pub rate_limit_requests_per_sec: u32,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -115,6 +119,7 @@ impl Config {
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_RPS", 10),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -149,9 +154,33 @@ impl std::fmt::Debug for Config {
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("payment_ttl_secs", &self.payment_ttl_secs)
+            .field(
+                "rate_limit_requests_per_sec",
+                &self.rate_limit_requests_per_sec,
+            )
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("listener_mode", &self.listener_mode)
             .finish()
+    }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse an env var into `T`, falling back to `default` (and warning) when the
+/// variable is set but unparseable, so a typo never silently breaks behaviour.
+fn parse_env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr,
+{
+    match std::env::var(key) {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            tracing::warn!("invalid value for {key}={raw:?}, using default");
+            default
+        }),
+        Err(_) => default,
     }
 }
 
@@ -174,40 +203,49 @@ mod tests {
             webhook_retry_delay_ms: 5000,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
+            rate_limit_requests_per_sec: 10,
             cors_allowed_origins: vec![],
             listener_mode: ListenerMode::Stream,
         };
         let output = format!("{cfg:?}");
-        assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
-        assert!(!output.contains("webhook-hmac-secret"), "webhook_secret must not appear in Debug output");
-        assert!(output.contains("***"), "redacted marker must appear in Debug output");
+        assert!(
+            !output.contains("super-secret-key"),
+            "gateway_secret must not appear in Debug output"
+        );
+        assert!(
+            !output.contains("webhook-hmac-secret"),
+            "webhook_secret must not appear in Debug output"
+        );
+        assert!(
+            output.contains("***"),
+            "redacted marker must appear in Debug output"
+        );
     }
 
     #[test]
     fn parse_accepted_assets_from_env_string() {
         let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2");
         assert_eq!(assets.len(), 3);
-        assert_eq!(assets[0], AcceptedAsset { code: "XLM".into(), issuer: None });
-        assert_eq!(assets[1], AcceptedAsset { code: "USDC".into(), issuer: Some("GISSUER".into()) });
-        assert_eq!(assets[2], AcceptedAsset { code: "EURC".into(), issuer: Some("GISSUER2".into()) });
-    }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// Parse an env var into `T`, falling back to `default` (and warning) when the
-/// variable is set but unparseable, so a typo never silently breaks behaviour.
-fn parse_env<T>(key: &str, default: T) -> T
-where
-    T: std::str::FromStr,
-{
-    match std::env::var(key) {
-        Ok(raw) => raw.parse().unwrap_or_else(|_| {
-            tracing::warn!("invalid value for {key}={raw:?}, using default");
-            default
-        }),
-        Err(_) => default,
+        assert_eq!(
+            assets[0],
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None
+            }
+        );
+        assert_eq!(
+            assets[1],
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GISSUER".into())
+            }
+        );
+        assert_eq!(
+            assets[2],
+            AcceptedAsset {
+                code: "EURC".into(),
+                issuer: Some("GISSUER2".into())
+            }
+        );
     }
 }
