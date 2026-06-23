@@ -19,7 +19,7 @@ fn make_config() -> Config {
         horizon_url: String::new(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         gateway_secret: String::new(),
-        accepted_assets: AcceptedAsset::default_list(),
+        accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,

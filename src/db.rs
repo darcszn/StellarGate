@@ -386,16 +386,15 @@ pub async fn list_payments_keyset(
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// All payments still awaiting confirmation, oldest first. Used by the Horizon
-/// poller to decide which memos to watch for on-chain. Rows whose TTL has
-/// elapsed are excluded even if the sweeper hasn't transitioned them yet, so an
-/// overdue intent is never polled.
+/// All payments still awaiting confirmation or top-up, oldest first. Rows whose
+/// TTL has elapsed are excluded even if the sweeper hasn't transitioned them
+/// yet, so an overdue intent is never polled.
 pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     let rows = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
-         WHERE status = 'pending'
+         WHERE status IN ('pending', 'underpaid')
            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')
          ORDER BY created_at ASC",
     )
@@ -405,16 +404,16 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition every `pending` payment whose TTL has elapsed to `expired`,
+/// Transition every watchable payment whose TTL has elapsed to `expired`,
 /// returning the rows that were swept so the caller can fire `payment.expired`
-/// webhooks. Each row is updated with a guard on `status = 'pending'` so a
-/// payment that settles concurrently is left untouched and not double-reported.
+/// webhooks. Each row is updated with a guard on a watchable status so a payment
+/// that settles concurrently is left untouched and not double-reported.
 pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
     let overdue = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
          FROM payments
-         WHERE status = 'pending'
+         WHERE status IN ('pending', 'underpaid')
            AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
          ORDER BY created_at ASC",
     )
@@ -428,7 +427,7 @@ pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
             "UPDATE payments
                 SET status = 'expired',
                     updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-              WHERE id = ? AND status = 'pending'",
+              WHERE id = ? AND status IN ('pending', 'underpaid')",
         )
         .bind(&payment.id)
         .execute(pool)
@@ -449,7 +448,10 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     let row = sqlx::query(
         "SELECT id, merchant_id, destination_address, memo, amount, asset, status,
                 webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-         FROM payments WHERE memo = ? AND status = 'pending'",
+         FROM payments
+         WHERE memo = ?
+           AND status IN ('pending', 'underpaid')
+           AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ','now')",
     )
     .bind(memo)
     .fetch_optional(pool)
@@ -661,6 +663,40 @@ mod tests {
         let pending = list_pending(&pool).await.unwrap();
         let ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["live"]);
+    }
+
+    #[tokio::test]
+    async fn underpaid_payment_remains_findable_for_topup() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("partial", "MEMOP", 3600))
+            .await
+            .unwrap();
+        update_payment_status(&pool, "partial", "underpaid", "TX1", "3")
+            .await
+            .unwrap();
+
+        let found = find_pending_by_memo(&pool, "MEMOP").await.unwrap().unwrap();
+        assert_eq!(found.id, "partial");
+        assert_eq!(found.status, "underpaid");
+        assert_eq!(found.paid_amount.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn overdue_underpaid_payment_expires() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("partial-dead", "MEMOX", -10))
+            .await
+            .unwrap();
+        update_payment_status(&pool, "partial-dead", "underpaid", "TX1", "3")
+            .await
+            .unwrap();
+
+        assert!(find_pending_by_memo(&pool, "MEMOX").await.unwrap().is_none());
+
+        let expired = expire_overdue(&pool).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "partial-dead");
+        assert_eq!(expired[0].status, "expired");
     }
 
     #[tokio::test]

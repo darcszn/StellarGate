@@ -346,26 +346,9 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
         .and_then(money::parse_stroops)
         .unwrap_or(0);
 
-    match verify(
-        &payment,
-        hp,
-        &state.config.accepted_assets,
-        already_paid_stroops,
-    ) {
-        Some(Verdict::Completed {
-            tx_hash,
-            paid_amount,
-        }) => {
-            settle(
-                state,
-                &payment,
-                "completed",
-                &tx_hash,
-                &paid_amount,
-                "payment.completed",
-                None,
-            )
-            .await;
+    match verify(&payment, hp, &state.config.accepted_assets, already_paid_stroops) {
+        Some(Verdict::Completed { tx_hash, paid_amount }) => {
+            settle(state, &payment, "completed", &tx_hash, &paid_amount, "payment.completed", None).await;
             Ok(true)
         }
         Some(Verdict::Overpaid {
