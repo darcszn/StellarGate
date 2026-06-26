@@ -694,7 +694,16 @@ mod tests {
     }
 
     fn test_assets() -> Vec<crate::config::AcceptedAsset> {
-        crate::config::AcceptedAsset::parse_list("XLM,USDC:GUSDC")
+        vec![
+            crate::config::AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
+            crate::config::AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GUSDC".into()),
+            },
+        ]
     }
 
     #[test]

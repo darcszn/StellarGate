@@ -307,11 +307,13 @@ pub async fn list_payments(
         .fetch_all(pool)
         .await?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?")
-            .bind(merchant_id)
-            .bind(s)
-            .fetch_one(pool)
-            .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM payments WHERE merchant_id = ? AND status = ?",
+        )
+        .bind(merchant_id)
+        .bind(s)
+        .fetch_one(pool)
+        .await?;
 
         (rows, total)
     } else {
@@ -646,13 +648,11 @@ fn hash_api_key(raw: &str) -> String {
 /// shown to the user by the caller and is not recoverable afterward.
 pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str) -> Result<()> {
     let hash = hash_api_key(raw_key);
-    sqlx::query(
-        "INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)",
-    )
-    .bind(id)
-    .bind(hash)
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
+        .bind(id)
+        .bind(hash)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -660,11 +660,10 @@ pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str) -> Result<()> {
 /// not match any registered merchant.
 pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<String>> {
     let hash = hash_api_key(raw_key);
-    let id: Option<String> =
-        sqlx::query_scalar("SELECT id FROM merchants WHERE api_key_hash = ?")
-            .bind(hash)
-            .fetch_optional(pool)
-            .await?;
+    let id: Option<String> = sqlx::query_scalar("SELECT id FROM merchants WHERE api_key_hash = ?")
+        .bind(hash)
+        .fetch_optional(pool)
+        .await?;
     Ok(id)
 }
 

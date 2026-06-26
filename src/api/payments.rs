@@ -263,8 +263,14 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
-        let (payments, total) =
-            db::list_payments(&state.pool, &merchant_id, q.status.as_deref(), limit, offset).await?;
+        let (payments, total) = db::list_payments(
+            &state.pool,
+            &merchant_id,
+            q.status.as_deref(),
+            limit,
+            offset,
+        )
+        .await?;
 
         // Provide next_cursor to ease migration to keyset pagination.
         let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));

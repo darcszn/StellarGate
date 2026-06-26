@@ -68,10 +68,7 @@ async fn test_server() -> TestServer {
 async fn provision_merchant(server: &TestServer) -> String {
     let res = server.post("/merchants").await;
     res.assert_status(StatusCode::CREATED);
-    res.json::<Value>()["api_key"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    res.json::<Value>()["api_key"].as_str().unwrap().to_string()
 }
 
 #[tokio::test]

@@ -1,10 +1,7 @@
 //! Rate-limit behaviour lives in its own integration binary on purpose.
 //!
-//! The limiter keeps a process-global table of per-IP limiters, created lazily
-//! on the first request from each IP. Sharing that table with the broader API
-//! tests (which run at a high limit) would let an earlier test create the limiter
-//! for the test client's IP at the wrong rate. A dedicated test binary gives this
-//! test a fresh, uncontaminated limiter table.
+//! The broader API tests run at a high limit and exercise merchant auth heavily.
+//! Keeping the low-quota assertion here makes the expected 429 path explicit.
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
@@ -60,13 +57,22 @@ async fn server_with_config(cfg: Config) -> TestServer {
     TestServer::new(router).unwrap()
 }
 
+async fn provision_merchant(server: &TestServer) -> String {
+    let res = server.post("/merchants").await;
+    res.assert_status(StatusCode::CREATED);
+    res.json::<Value>()["api_key"].as_str().unwrap().to_string()
+}
+
 #[tokio::test]
 async fn test_rate_limit_exceeded_returns_429() {
     let server = server_with_config(make_config(1)).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
 
     // The first request consumes the single per-second token.
     let first = server
         .post("/payments")
+        .add_header("Authorization", auth.clone())
         .json(&json!({ "amount": "1", "asset": "XLM" }))
         .await;
     first.assert_status(StatusCode::CREATED);
@@ -74,6 +80,7 @@ async fn test_rate_limit_exceeded_returns_429() {
     // A second immediate request exceeds the quota and is rejected.
     let second = server
         .post("/payments")
+        .add_header("Authorization", auth)
         .json(&json!({ "amount": "1", "asset": "XLM" }))
         .await;
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
