@@ -379,11 +379,14 @@ pub async fn list_webhooks(
 
 pub async fn redeliver_webhook(
     State(state): State<Arc<AppState>>,
+    Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path((payment_id, delivery_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
-    // Verify payment exists
+    // Verify payment exists and belongs to the caller. A payment owned by
+    // another merchant reports the same 404 as a missing one.
     db::get_payment(&state.pool, &payment_id)
         .await?
+        .filter(|p| p.merchant_id == merchant_id)
         .ok_or_else(|| {
             AppError::new(
                 StatusCode::NOT_FOUND,

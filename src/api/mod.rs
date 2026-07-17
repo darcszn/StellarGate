@@ -54,11 +54,16 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // Merchant provisioning — returns a one-time plaintext API key.
         .route("/merchants", post(provision_merchant))
         .nest("/payments", {
-            // Auth middleware only on the write + list routes; the per-payment
-            // status and webhook endpoints stay public (anyone with the id can
-            // poll or inspect).
+            // Auth middleware on the write + list routes and webhook
+            // redelivery (it triggers a merchant-scoped outbound request);
+            // the per-payment status and webhook-listing endpoints stay
+            // public (anyone with the id can poll or inspect).
             let authed = axum::Router::new()
                 .route("/", post(payments::create).get(payments::list))
+                .route(
+                    "/:id/webhooks/:delivery_id/redeliver",
+                    post(payments::redeliver_webhook),
+                )
                 .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     auth_middleware,
@@ -68,16 +73,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
                 .merge(authed)
                 .route("/:id", get(payments::get_by_id))
                 .route("/:id/webhooks", get(payments::list_webhooks))
-                .route(
-                    "/:id/webhooks/:delivery_id/redeliver",
-                    post(payments::redeliver_webhook),
-                )
-                .layer(middleware::from_fn(
-                    move |ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next| {
-                        rate_limit_middleware(addr, rate_limit_rps, req, next)
-                    },
-                ))
-                .layer(tower_http::util::ConnectInfoLayer::new())
         })
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
@@ -165,8 +160,11 @@ async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> axum::response::Response {
-    if req.method() == axum::http::Method::POST && req.uri().path() == "/payments" {
-        let key = rate_limit_key(&req);
+    if let Some(bucket) = rate_limited_bucket(&req) {
+        // Keyed by bucket + client, not the raw (dynamic) path — a payment or
+        // delivery id in the URL must never become its own limiter entry, or
+        // the map would grow without bound.
+        let key = format!("{bucket}:{}", rate_limit_key(&req));
         let limited = {
             let mut map = rate_limit.limiters.lock().unwrap();
             let limiter = map.entry(key).or_insert_with(|| {
@@ -191,6 +189,22 @@ async fn rate_limit_middleware(
     }
 
     next.run(req).await
+}
+
+/// Identifies which rate-limit bucket (if any) a request falls into. Returns
+/// `None` for everything else, so unrelated routes aren't limited at all.
+fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
+    if req.method() != axum::http::Method::POST {
+        return None;
+    }
+    let path = req.uri().path();
+    if path == "/payments" {
+        return Some("payments");
+    }
+    if path.starts_with("/payments/") && path.ends_with("/redeliver") {
+        return Some("redeliver");
+    }
+    None
 }
 
 fn rate_limit_key(req: &Request) -> String {

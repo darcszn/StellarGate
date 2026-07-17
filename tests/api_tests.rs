@@ -595,10 +595,22 @@ async fn test_list_webhooks_empty() {
 }
 
 #[tokio::test]
-async fn test_redeliver_webhook_not_found() {
+async fn test_redeliver_unauthenticated_returns_401() {
     let res = test_server()
         .await
         .post("/payments/nonexistent/webhooks/xyz/redeliver")
+        .await;
+    res.assert_status(StatusCode::UNAUTHORIZED);
+    assert_eq!(res.json::<Value>()["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn test_redeliver_webhook_not_found() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .post("/payments/nonexistent/webhooks/xyz/redeliver")
+        .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
 }
@@ -607,9 +619,10 @@ async fn test_redeliver_webhook_not_found() {
 async fn test_redeliver_delivery_not_found() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
     let id = server
         .post("/payments")
-        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Authorization", auth.clone())
         .json(&json!({ "amount": "5", "asset": "XLM" }))
         .await
         .json::<Value>()["id"]
@@ -619,8 +632,46 @@ async fn test_redeliver_delivery_not_found() {
 
     let res = server
         .post(&format!("/payments/{id}/webhooks/nonexistent/redeliver"))
+        .add_header("Authorization", auth)
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
+}
+
+/// A merchant cannot trigger redelivery of another merchant's webhook — the
+/// payment id alone must not be enough, and the response must not
+/// distinguish "not yours" from "doesn't exist".
+#[tokio::test]
+async fn test_redeliver_rejects_other_merchants_payment() {
+    let (server, pool) = test_server_with_pool().await;
+
+    let owner_key = provision_merchant(&server).await;
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {owner_key}"))
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-owned",
+        &id,
+        "https://example.com/webhook",
+        r#"{"event":"payment.completed"}"#,
+    )
+    .await
+    .unwrap();
+
+    let other_key = provision_merchant(&server).await;
+    let res = server
+        .post(&format!("/payments/{id}/webhooks/delivery-owned/redeliver"))
+        .add_header("Authorization", format!("Bearer {other_key}"))
+        .await;
+    res.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(res.json::<Value>()["code"], "payment_not_found");
 }
 
 #[tokio::test]
@@ -642,7 +693,7 @@ async fn test_webhook_delivery_isolation() {
 
     let id2 = server
         .post("/payments")
-        .add_header("Authorization", auth)
+        .add_header("Authorization", auth.clone())
         .json(&json!({ "amount": "10", "asset": "USDC" }))
         .await
         .json::<Value>()["id"]
@@ -680,6 +731,7 @@ async fn test_webhook_delivery_isolation() {
     // Try to redeliver delivery from payment 1 on payment 2 (should fail)
     let res_cross = server
         .post(&format!("/payments/{id2}/webhooks/delivery-1/redeliver"))
+        .add_header("Authorization", auth)
         .await;
     res_cross.assert_status(StatusCode::NOT_FOUND);
 }
