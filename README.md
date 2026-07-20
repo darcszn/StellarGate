@@ -254,7 +254,7 @@ List payments, newest first.
 
 | Param | Description | Default |
 |---|---|---|
-| `status` | Filter by `pending`, `completed`, `failed`, or `expired` | all |
+| `status` | Filter by `pending`, `completed`, `underpaid`, `failed`, or `expired` | all |
 | `limit` | Page size (1–100) | `20` |
 | `offset` | Rows to skip | `0` |
 

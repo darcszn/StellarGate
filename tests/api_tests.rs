@@ -652,6 +652,45 @@ async fn test_list_filter_by_status() {
     assert_eq!(res.json::<Value>()["total"], 1);
 }
 
+/// Settlement puts a partially-paid intent in `underpaid`, so merchants must
+/// be able to list them — it's how you find payments still owed money.
+#[tokio::test]
+async fn test_list_filters_by_underpaid_status() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    let mut ids = vec![];
+    for amt in ["5", "6"] {
+        ids.push(
+            server
+                .post("/payments")
+                .add_header("Authorization", auth.clone())
+                .json(&json!({ "amount": amt, "asset": "XLM" }))
+                .await
+                .json::<Value>()["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    // Mirror what horizon::settle does for a short payment.
+    stellargate::db::update_payment_status(&pool, &ids[0], "underpaid", "TX_PARTIAL", "3")
+        .await
+        .unwrap();
+
+    let res = server
+        .get("/payments?status=underpaid")
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["payments"][0]["id"], ids[0]);
+    assert_eq!(body["payments"][0]["status"], "underpaid");
+}
+
 #[tokio::test]
 async fn test_list_invalid_status() {
     let server = test_server().await;
