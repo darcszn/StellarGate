@@ -34,9 +34,11 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         db_busy_timeout_ms: 5000,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
-        webhook_allow_private_targets: false,
+        admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
     }
 }
+
+const TEST_ADMIN_SECRET: &str = "test-admin-secret";
 
 async fn server_with_config(cfg: Config) -> TestServer {
     let pool = SqlitePoolOptions::new()
@@ -59,7 +61,10 @@ async fn server_with_config(cfg: Config) -> TestServer {
 }
 
 async fn provision_merchant(server: &TestServer) -> String {
-    let res = server.post("/merchants").await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
     res.assert_status(StatusCode::CREATED);
     res.json::<Value>()["api_key"].as_str().unwrap().to_string()
 }

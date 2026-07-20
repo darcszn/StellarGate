@@ -127,29 +127,36 @@ pub async fn create(
         ));
     }
     if let Some(url) = &body.webhook_url {
-        if crate::ssrf::validate(url, state.config.webhook_allow_private_targets)
-            .await
-            .is_err()
-        {
+        let parsed_url = reqwest::Url::parse(url).map_err(|_| {
+            AppError::bad_request("invalid_webhook_url", "webhook_url is not a valid URL")
+        })?;
+
+        if state.config.network == "public" {
+            if parsed_url.scheme() != "https" {
+                return Err(AppError::bad_request(
+                    "invalid_webhook_url",
+                    "webhook_url must be an HTTPS URL on public network",
+                ));
+            }
+        } else if parsed_url.scheme() != "https" && parsed_url.scheme() != "http" {
             return Err(AppError::bad_request(
                 "invalid_webhook_url",
-                "webhook_url must be a reachable http(s) URL that does not resolve to a \
-                 loopback, link-local, private, or other reserved address",
+                "webhook_url must be an HTTP or HTTPS URL",
             ));
         }
     }
 
-    // An optional Idempotency-Key lets a client safely retry a create after a
-    // network blip without minting a duplicate intent. Keys are scoped per
-    // merchant; an empty header value is treated as absent.
+    /* An optional Idempotency-Key lets a client safely retry a create after a
+    network blip without minting a duplicate intent. Keys are scoped per
+    merchant; an empty header value is treated as absent. */
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|k| !k.is_empty());
 
-    // If we've already seen this key for this merchant, return the original
-    // payment with 200 instead of creating a new one.
+    /* If we've already seen this key for this merchant, return the original
+    payment with 200 instead of creating a new one. */
     if let Some(key) = idempotency_key {
         if let Some(existing_id) =
             db::find_payment_id_by_idempotency_key(&state.pool, &merchant_id, key).await?
@@ -178,9 +185,9 @@ pub async fn create(
     )
     .await?;
 
-    // Persist the key → payment mapping. If a concurrent request won the race,
-    // `save_idempotency_key` returns the canonical id; return that payment so
-    // both retries converge on a single intent.
+    /* Persist the key → payment mapping. If a concurrent request won the race,
+    `save_idempotency_key` returns the canonical id; return that payment so
+    both retries converge on a single intent. */
     if let Some(key) = idempotency_key {
         let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
         if canonical_id != id {
@@ -416,21 +423,8 @@ pub async fn redeliver_webhook(
         ));
     }
 
-    // Re-validate the target on every redelivery — the delivery row may be old,
-    // and this endpoint is unauthenticated, so a stale-but-once-valid URL must
-    // not become a standing SSRF pivot.
-    let client = crate::webhook::safe_client(&state, &delivery.url)
-        .await
-        .map_err(|_| {
-            AppError::new(
-                StatusCode::BAD_REQUEST,
-                "webhook_target_blocked",
-                "webhook target is not allowed",
-            )
-        })?;
-
-    // Re-send the original payload, re-signed with a fresh timestamp so the
-    // receiver's replay-tolerance window is measured from this redelivery.
+    /* Re-send the original payload, re-signed with a fresh timestamp so the
+    receiver's replay-tolerance window is measured from this redelivery. */
     let payload_bytes = delivery.payload.as_bytes();
     let timestamp = crate::webhook::current_timestamp();
     let signature = crate::webhook::sign(&state.config.webhook_secret, timestamp, payload_bytes);

@@ -264,6 +264,7 @@ components:
         webhook_url:
           type: string
           format: uri
+          description: Webhook endpoint URL. Must be HTTPS in production.
           example: https://yourapp.com/webhooks/stellar
 
     ListPaymentsResponse:

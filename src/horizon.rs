@@ -263,8 +263,8 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
         .and_then(|p| p.paging_token.clone())
     {
         Some(token) => {
-            // Persist immediately so a crash before the first page still leaves
-            // us baselined rather than replaying history next time.
+            /* Persist immediately so a crash before the first page still leaves
+            us baselined rather than replaying history next time. */
             db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &token).await?;
             info!(cursor = %token, "Horizon poller baselined at latest payment");
             Ok(token)
@@ -305,9 +305,9 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
             }
         }
 
-        // Checkpoint after the whole page is processed. If we crash mid-page the
-        // cursor still points at the last fully-processed page, and re-reading
-        // the unfinished page is harmless (settled intents are skipped).
+        /* Checkpoint after the whole page is processed. If we crash mid-page the
+        cursor still points at the last fully-processed page, and re-reading
+        the unfinished page is harmless (settled intents are skipped). */
         db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &cursor).await?;
 
         // A short page means Horizon has nothing newer — we're caught up.
@@ -332,8 +332,8 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
         None => return Ok(false),
     };
 
-    // Skip transactions already recorded for this intent. This prevents
-    // double-counting the original underpayment tx on subsequent poll cycles.
+    /* Skip transactions already recorded for this intent. This prevents
+    double-counting the original underpayment tx on subsequent poll cycles. */
     let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
     if payment.tx_hash.as_deref() == Some(hp_hash) {
         return Ok(false);
@@ -441,8 +441,8 @@ async fn settle(
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
-    // Webhook delivery is handled asynchronously by the webhook subsystem
-    // (recording here is non-blocking from reconciliation's point of view).
+    /* Webhook delivery is handled asynchronously by the webhook subsystem
+    (recording here is non-blocking from reconciliation's point of view). */
     webhook::dispatch(state, &settled, event, delta).await;
 }
 
@@ -497,8 +497,8 @@ fn parse_sse_block(block: &str) -> SseEvent {
     let mut ev = SseEvent::default();
     let mut data_lines: Vec<&str> = Vec::new();
     for line in block.lines() {
-        // Per the spec a value has its single leading space (if present)
-        // stripped after the colon.
+        /* Per the spec a value has its single leading space (if present)
+        stripped after the colon. */
         if let Some(rest) = line.strip_prefix("data:") {
             data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
         } else if let Some(rest) = line.strip_prefix("event:") {
@@ -524,8 +524,8 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
 
     info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
 
-    // A dedicated client without the shared client's overall request timeout —
-    // the SSE connection is long-lived and must not be cut off mid-stream.
+    /* A dedicated client without the shared client's overall request timeout —
+    the SSE connection is long-lived and must not be cut off mid-stream. */
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
@@ -596,15 +596,15 @@ async fn stream_once(
         .error_for_status()?;
 
     let mut stream = resp.bytes_stream();
-    // Accumulate raw bytes (not lossily-decoded str) so multibyte characters
-    // split across chunk boundaries are never corrupted.
+    /* Accumulate raw bytes (not lossily-decoded str) so multibyte characters
+    split across chunk boundaries are never corrupted. */
     let mut buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = stream.next().await {
         buf.extend_from_slice(&chunk?);
 
-        // Dispatch every complete event (terminated by a blank line) in the
-        // buffer, leaving any partial trailing event for the next chunk.
+        /* Dispatch every complete event (terminated by a blank line) in the
+        buffer, leaving any partial trailing event for the next chunk. */
         while let Some(end) = find_event_end(&buf) {
             let block: Vec<u8> = buf.drain(..end).collect();
             let text = String::from_utf8_lossy(&block);
@@ -906,8 +906,8 @@ mod tests {
 
     #[test]
     fn streamed_payment_deserializes_into_verifiable_record() {
-        // A single Horizon payment record as pushed over SSE (note: a streamed
-        // record carries its memo inline under `transaction`, same as the page).
+        /* A single Horizon payment record as pushed over SSE (note: a streamed
+        record carries its memo inline under `transaction`, same as the page). */
         let data = r#"{
             "type": "payment",
             "amount": "10.0000000",

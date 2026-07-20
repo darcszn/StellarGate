@@ -34,9 +34,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         rate_limit_requests_per_sec: 1000,
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
-        // These tests dispatch to a wiremock server on 127.0.0.1, which the
-        // SSRF guard would otherwise block.
-        webhook_allow_private_targets: true,
+        admin_provisioning_secret: String::new(),
     }
 }
 
@@ -94,8 +92,8 @@ async fn dispatch_delivers_successfully_with_valid_signature() {
     let received = server.received_requests().await.unwrap();
     assert_eq!(received.len(), 1);
     let req = &received[0];
-    // The signature now covers "{timestamp}.{body}", so verify using the
-    // timestamp the request advertises in its header.
+    /* The signature now covers "{timestamp}.{body}", so verify using the
+    timestamp the request advertises in its header. */
     let timestamp: i64 = req
         .headers
         .get("X-StellarGate-Timestamp")

@@ -181,9 +181,9 @@ mod tests {
 
     #[test]
     fn signature_matches_known_vector() {
-        // Locks the Stripe-style signed payload format "{timestamp}.{body}".
-        // Independently reproducible:
-        //   printf '1700000000.{"id":"evt_1"}' | openssl dgst -sha256 -hmac whsec_test
+        /* Locks the Stripe-style signed payload format "{timestamp}.{body}".
+        Independently reproducible:
+          printf '1700000000.{"id":"evt_1"}' | openssl dgst -sha256 -hmac whsec_test */
         let sig = sign("whsec_test", 1_700_000_000, br#"{"id":"evt_1"}"#);
         assert_eq!(
             sig,
@@ -193,8 +193,8 @@ mod tests {
 
     #[test]
     fn signature_covers_timestamp() {
-        // The whole point of the timestamp: changing only it changes the
-        // signature, so an old signature cannot be replayed with a fresh time.
+        /* The whole point of the timestamp: changing only it changes the
+        signature, so an old signature cannot be replayed with a fresh time. */
         let body = b"{\"event\":\"payment.completed\"}";
         assert_ne!(
             sign("secret", 1_700_000_000, body),

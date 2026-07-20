@@ -48,9 +48,9 @@ async fn main() -> Result<()> {
     // Broadcast shutdown to all background tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Detect on-chain payments. In stream mode the SSE listener settles intents
-    // in near real time while the poller runs alongside as a reconciler; in
-    // poll mode only the interval poller runs.
+    /* Detect on-chain payments. In stream mode the SSE listener settles intents
+    in near real time while the poller runs alongside as a reconciler; in
+    poll mode only the interval poller runs. */
     let stream_handle = if cfg.listener_mode == ListenerMode::Stream {
         Some(tokio::spawn(horizon::run_stream_listener(
             state.clone(),

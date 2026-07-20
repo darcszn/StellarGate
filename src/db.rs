@@ -44,10 +44,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Bring pre-existing payment tables up to schema. New databases already have
-    // `expires_at` from the CREATE TABLE above; older ones need it added in
-    // place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
-    // add it nullable and backfill below.
+    /* Bring pre-existing payment tables up to schema. New databases already have
+    `expires_at` from the CREATE TABLE above; older ones need it added in
+    place. SQLite rejects a non-constant DEFAULT on ALTER ... ADD COLUMN, so we
+    add it nullable and backfill below. */
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
@@ -58,9 +58,9 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .execute(pool)
             .await?;
     }
-    // Backfill any row without an expiry (legacy rows, or rows inserted in the
-    // brief window before the column existed). `created_at + 1h` mirrors the
-    // default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form.
+    /* Backfill any row without an expiry (legacy rows, or rows inserted in the
+    brief window before the column existed). `created_at + 1h` mirrors the
+    default TTL; SQLite's date functions accept the stored RFC 3339 `Z` form. */
     sqlx::query(
         "UPDATE payments
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
@@ -96,8 +96,8 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Durable key/value state — used by the Horizon poller to persist its
-    // paging cursor so it resumes exactly where it left off across restarts.
+    /* Durable key/value state — used by the Horizon poller to persist its
+    paging cursor so it resumes exactly where it left off across restarts. */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS kv_state (
             key TEXT PRIMARY KEY,
@@ -108,9 +108,9 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Merchants are provisioned via POST /merchants. The raw API key is never
-    // stored; only its SHA-256 hex digest is persisted so a DB breach does not
-    // expose live credentials.
+    /* Merchants are provisioned via POST /merchants. The raw API key is never
+    stored; only its SHA-256 hex digest is persisted so a DB breach does not
+    expose live credentials. */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS merchants (
             id TEXT PRIMARY KEY,
@@ -121,10 +121,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Idempotency keys for payment creation. A key is unique per merchant and
-    // maps to the payment id minted for the first request that used it, so a
-    // client retrying after a network blip gets the original payment back
-    // instead of a duplicate intent.
+    /* Idempotency keys for payment creation. A key is unique per merchant and
+    maps to the payment id minted for the first request that used it, so a
+    client retrying after a network blip gets the original payment back
+    instead of a duplicate intent. */
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS idempotency_keys (
             merchant_id TEXT NOT NULL,
@@ -137,9 +137,9 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
-    // Normalise legacy rows that were written by the old datetime('now') default,
-    // which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
-    // startup — the WHERE clause skips rows that are already RFC 3339.
+    /* Normalise legacy rows that were written by the old datetime('now') default,
+    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
+    startup — the WHERE clause skips rows that are already RFC 3339. */
     for tbl_col in [
         ("payments", "created_at"),
         ("payments", "updated_at"),
@@ -207,8 +207,8 @@ pub struct NewPayment<'a> {
 }
 
 pub async fn create_payment(pool: &Db, new: NewPayment<'_>) -> Result<Payment> {
-    // Compute the expiry as `now + ttl_secs` in SQLite so it shares the exact
-    // clock and RFC 3339 format as created_at.
+    /* Compute the expiry as `now + ttl_secs` in SQLite so it shares the exact
+    clock and RFC 3339 format as created_at. */
     let ttl_modifier = format!("{:+} seconds", new.ttl_secs);
     sqlx::query(
         "INSERT INTO payments (id, merchant_id, destination_address, memo, amount, asset, webhook_url, expires_at)
@@ -458,8 +458,8 @@ pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
         .execute(pool)
         .await?;
 
-        // Only report rows we actually transitioned; a concurrent settlement
-        // may have flipped the status out from under us.
+        /* Only report rows we actually transitioned; a concurrent settlement
+        may have flipped the status out from under us. */
         if result.rows_affected() == 1 {
             payment.status = "expired".to_string();
             expired.push(payment);
@@ -633,9 +633,9 @@ pub async fn ping(pool: &Db) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Merchant API-key management
-// ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+Merchant API-key management
+--------------------------------------------------------------------------- */
 
 /// Hash a raw API key with SHA-256, returning the hex digest.
 /// This is the only representation stored in the database.

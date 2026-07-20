@@ -128,8 +128,8 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_checksum() {
-        // Flip a character deep in the key body: length and alphabet stay valid,
-        // but the trailing checksum no longer matches.
+        /* Flip a character deep in the key body: length and alphabet stay valid,
+        but the trailing checksum no longer matches. */
         let mut chars: Vec<char> = VALID.chars().collect();
         chars[20] = if chars[20] == 'A' { 'B' } else { 'A' };
         let corrupted: String = chars.into_iter().collect();
