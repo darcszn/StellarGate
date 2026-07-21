@@ -92,6 +92,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             // Allow loopback targets so we can use wiremock's 127.0.0.1 server.
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
+            request_timeout_secs: 30,
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),

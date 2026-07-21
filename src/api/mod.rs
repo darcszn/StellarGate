@@ -12,10 +12,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 
@@ -46,6 +48,7 @@ impl RateLimitState {
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
     let rate_limit = RateLimitState::new(state.config.rate_limit_requests_per_sec);
+    let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
@@ -92,6 +95,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             rate_limit_middleware,
         ))
         .layer(cors)
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
         .with_state(state)
 }
 
@@ -322,4 +329,43 @@ async fn not_found() -> impl IntoResponse {
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "not found", "code": "not_found" })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+    use tower_http::timeout::TimeoutLayer;
+
+    /// Exercises the exact `TimeoutLayer` construction used in `router()`,
+    /// against a router small enough to run with millisecond durations —
+    /// `request_timeout_secs` itself is whole seconds, too coarse for a fast test.
+    fn timeout_test_router(timeout: Duration) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }),
+            )
+            .route("/fast", get(|| async { "ok" }))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                timeout,
+            ))
+    }
+
+    #[tokio::test]
+    async fn slow_handler_is_aborted_with_408() {
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(20))).unwrap();
+        let response = server.get("/slow").await;
+        response.assert_status(StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn fast_handler_is_unaffected() {
+        let server = TestServer::new(timeout_test_router(Duration::from_millis(200))).unwrap();
+        let response = server.get("/fast").await;
+        response.assert_status_ok();
+    }
 }

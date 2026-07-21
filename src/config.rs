@@ -135,6 +135,11 @@ pub struct Config {
     /// `POST /merchants`. Empty disables provisioning entirely — the endpoint
     /// rejects every request rather than falling back to an open default.
     pub admin_provisioning_secret: String,
+    /// Per-request timeout for the whole API, in seconds. A request whose
+    /// handler hasn't produced a response within this window is aborted with
+    /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
+    /// a connection indefinitely. Defaults to 30 seconds.
+    pub request_timeout_secs: u64,
 }
 
 impl Config {
@@ -191,10 +196,6 @@ impl Config {
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
             webhook_timeout_secs: parse_env("WEBHOOK_TIMEOUT_SECS", 10)?,
-            webhook_redrive_interval_secs: parse_env("WEBHOOK_REDRIVE_INTERVAL_SECS", 30)?,
-            webhook_redrive_concurrency: parse_env("WEBHOOK_REDRIVE_CONCURRENCY", 4)?,
-            webhook_redrive_max_attempts: parse_env("WEBHOOK_REDRIVE_MAX_ATTEMPTS", 8)?,
-            webhook_redrive_grace_secs: parse_env("WEBHOOK_REDRIVE_GRACE_SECS", 60)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
@@ -206,6 +207,7 @@ impl Config {
             ),
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
+            request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
@@ -255,6 +257,7 @@ impl Config {
     /// - `WEBHOOK_RETRY_ATTEMPTS == 0` → webhooks are never delivered
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
+    /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
     fn validate_timing(&self) -> Result<()> {
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
@@ -295,24 +298,10 @@ impl Config {
             ));
         }
 
-        if self.webhook_redrive_interval_secs == 0 {
+        if self.request_timeout_secs == 0 {
             return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_INTERVAL_SECS must be > 0 (got 0). \
-                 A zero interval creates a tight redrive loop at 100% CPU."
-            ));
-        }
-
-        if self.webhook_redrive_concurrency == 0 {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_CONCURRENCY must be > 0 (got 0). \
-                 Zero concurrency means stuck deliveries are never redriven."
-            ));
-        }
-
-        if self.webhook_redrive_max_attempts == 0 {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_MAX_ATTEMPTS must be > 0 (got 0). \
-                 Zero attempts means stuck deliveries are immediately abandoned."
+                "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would abort every request immediately."
             ));
         }
 
@@ -398,6 +387,7 @@ impl std::fmt::Debug for Config {
                 &self.webhook_allow_private_targets,
             )
             .field("admin_provisioning_secret", &"***")
+            .field("request_timeout_secs", &self.request_timeout_secs)
             .finish()
     }
 }
@@ -460,6 +450,7 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
+            request_timeout_secs: 30,
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -533,6 +524,7 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
+            request_timeout_secs: 30,
         }
     }
 

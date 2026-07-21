@@ -46,6 +46,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
+        request_timeout_secs: 30,
     }
 }
 

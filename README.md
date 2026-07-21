@@ -84,6 +84,7 @@ cp .env.example .env
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF guard's loopback/link-local/private/reserved IP check on `webhook_url` (still requires http(s) and a resolvable host). For local development and tests only — never enable in production. | `false` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` and `POST /merchants` (requests per second per IP, tracked independently per route) | `10` |
+| `REQUEST_TIMEOUT_SECS` | Per-request timeout for the whole API. A request without a response within this window is aborted with `408 Request Timeout`. | `30` |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite connection pool size. WAL mode allows one writer + many concurrent readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | How long (ms) SQLite waits to acquire a write lock before returning an error. Must be `> 0` under concurrent load. | `5000` |
 | `ADMIN_PROVISIONING_SECRET` | Shared secret required via the `X-Admin-Secret` header to call `POST /merchants`. Unset disables provisioning entirely (every request gets `401`). | _(unset — provisioning disabled)_ |
