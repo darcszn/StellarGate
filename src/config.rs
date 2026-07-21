@@ -126,7 +126,7 @@ impl Config {
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
 
         let config = Self {
-            port: parse_env("PORT", 3000),
+            port: parse_env("PORT", 3000)?,
             database_url,
             network,
             horizon_url,
@@ -141,13 +141,13 @@ impl Config {
                 }
             },
             webhook_secret,
-            webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
-            webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
-            poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
-            payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
-            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10),
-            db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10),
-            db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000),
+            webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
+            webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
+            poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
+            payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
+            rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
+            db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10)?,
+            db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000)?,
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -158,7 +158,7 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
-            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false),
+            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
         };
         config.validate_addresses()?;
@@ -268,18 +268,26 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Parse an env var into `T`, falling back to `default` (and warning) when the
-/// variable is set but unparseable, so a typo never silently breaks behaviour.
-fn parse_env<T>(key: &str, default: T) -> T
+/// Parse an env var into `T`.
+///
+/// - If the variable is absent, `default` is returned.
+/// - If the variable is present but cannot be parsed, boot is aborted with a
+///   clear error message instead of silently falling back to the default.
+///   This prevents misconfigured values (e.g. a typo in `PAYMENT_TTL_SECS`)
+///   from going unnoticed in production.
+fn parse_env<T>(key: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
     match std::env::var(key) {
-        Ok(raw) => raw.parse().unwrap_or_else(|_| {
-            tracing::warn!("invalid value for {key}={raw:?}, using default");
-            default
+        Ok(raw) => raw.parse::<T>().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid value for {key}={raw:?}: {e}. \
+                 Fix the environment variable or remove it to use the default."
+            )
         }),
-        Err(_) => default,
+        Err(_) => Ok(default),
     }
 }
 
@@ -550,6 +558,51 @@ mod tests {
                 assert_eq!(
                     cfg.webhook_secret,
                     "a-very-long-and-secure-webhook-signing-secret-32-chars"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn parse_env_fails_fast_on_invalid_numeric_value() {
+        run_with_env(&[("PAYMENT_TTL_SECS", Some("not-a-number"))], || {
+            let err = parse_env::<u64>("PAYMENT_TTL_SECS", 3600)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("PAYMENT_TTL_SECS"),
+                "error must name the variable; got: {err}"
+            );
+            assert!(
+                err.contains("not-a-number"),
+                "error must echo the bad value; got: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn parse_env_returns_default_when_variable_is_absent() {
+        run_with_env(&[("PAYMENT_TTL_SECS", None)], || {
+            let result = parse_env::<u64>("PAYMENT_TTL_SECS", 3600).unwrap();
+            assert_eq!(result, 3600);
+        });
+    }
+
+    #[test]
+    fn startup_fails_on_invalid_poll_interval() {
+        run_with_env(
+            &[
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("POLL_INTERVAL_SECS", Some("oops")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("POLL_INTERVAL_SECS"),
+                    "error must name the variable; got: {err}"
                 );
             },
         );
