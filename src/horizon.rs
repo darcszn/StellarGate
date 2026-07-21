@@ -321,7 +321,10 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 
 /// Look up the pending intent matching this Horizon payment by memo, verify it,
 /// and settle it if it matches. Returns `true` when an intent was settled.
-async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<bool> {
+///
+/// This is intentionally `pub` so integration tests can drive concurrent
+/// reconciliations to verify the single-settlement guarantee (issue #155).
+pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<bool> {
     let memo = match hp.memo() {
         Some(m) => m,
         None => return Ok(false),
@@ -356,7 +359,7 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
             tx_hash,
             paid_amount,
         }) => {
-            settle(
+            let did_settle = settle(
                 state,
                 &payment,
                 "completed",
@@ -366,7 +369,7 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 None,
             )
             .await;
-            Ok(true)
+            Ok(did_settle)
         }
         Some(Verdict::Overpaid {
             tx_hash,
@@ -378,7 +381,7 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 excess = %delta.as_deref().unwrap_or("?"),
                 "overpayment — intent completed, excess should be refunded"
             );
-            settle(
+            let did_settle = settle(
                 state,
                 &payment,
                 "completed",
@@ -388,7 +391,7 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 delta.as_deref(),
             )
             .await;
-            Ok(true)
+            Ok(did_settle)
         }
         Some(Verdict::Underpaid {
             tx_hash,
@@ -402,7 +405,7 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 remaining = %delta.as_deref().unwrap_or("?"),
                 "underpayment — intent remains open for a top-up"
             );
-            settle(
+            let did_settle = settle(
                 state,
                 &payment,
                 "underpaid",
@@ -412,13 +415,20 @@ async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow
                 delta.as_deref(),
             )
             .await;
-            Ok(true)
+            Ok(did_settle)
         }
         None => Ok(false),
     }
 }
 
 /// Persist a terminal or intermediate status for `payment` and fire its webhook.
+/// Returns `true` when the row was actually updated (i.e. a settlement was
+/// committed); returns `false` when the status guard rejected the update because
+/// a concurrent reconciler already settled the intent.
+///
+/// Callers must propagate this return value so `reconcile_payment` can report
+/// accurately whether it settled an intent, which is what the concurrency test
+/// asserts (issue #155).
 async fn settle(
     state: &Arc<AppState>,
     payment: &db::Payment,
@@ -427,12 +437,21 @@ async fn settle(
     paid_amount: &str,
     event: &str,
     delta: Option<&str>,
-) {
-    if let Err(e) =
-        db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await
-    {
-        warn!(payment_id = %payment.id, error = %e, "failed to update payment status");
-        return;
+) -> bool {
+    match db::update_payment_status(&state.pool, &payment.id, status, tx_hash, paid_amount).await {
+        Err(e) => {
+            warn!(payment_id = %payment.id, error = %e, "failed to update payment status");
+            return false;
+        }
+        Ok(false) => {
+            // A concurrent reconciler already settled this intent — skip the webhook.
+            debug!(
+                payment_id = %payment.id,
+                "skipping duplicate settlement (status guard rejected update)"
+            );
+            return false;
+        }
+        Ok(true) => {}
     }
     info!(payment_id = %payment.id, status, %tx_hash, "payment settled");
 
@@ -444,6 +463,7 @@ async fn settle(
     /* Webhook delivery is handled asynchronously by the webhook subsystem
     (recording here is non-blocking from reconciliation's point of view). */
     webhook::dispatch(state, &settled, event, delta).await;
+    true
 }
 
 /// Background loop that polls Horizon on the configured interval until the

@@ -171,7 +171,9 @@ pub async fn create(
         .filter(|k| !k.is_empty());
 
     /* If we've already seen this key for this merchant, return the original
-    payment with 200 instead of creating a new one. */
+    payment with 200 instead of creating a new one. If the mapped payment row
+    is missing (e.g. a previous winner crashed after inserting the key but
+    before creating the payment), delete the stale mapping and proceed. */
     if let Some(key) = idempotency_key {
         if let Some(existing_id) =
             db::find_payment_id_by_idempotency_key(&state.pool, &merchant_id, key).await?
@@ -179,11 +181,41 @@ pub async fn create(
             if let Some(payment) = db::get_payment(&state.pool, &existing_id).await? {
                 return Ok((StatusCode::OK, Json(to_json(&payment))));
             }
+            sqlx::query(
+                "DELETE FROM idempotency_keys WHERE merchant_id = ? AND idempotency_key = ?",
+            )
+            .bind(&merchant_id)
+            .bind(key)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
+
+    let id = Uuid::new_v4().to_string();
+
+    /* Reserve the idempotency key before minting the payment so concurrent
+    same-key requests can't both create payments. The DB primary key
+    serialises the race: only one request's INSERT succeeds. */
+    if let Some(key) = idempotency_key {
+        let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
+        if canonical_id != id {
+            /* Lost the race — the winner is about to create its payment. Wait
+            for it with a short retry loop and then return that payment. */
+            for _ in 0..50 {
+                if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
+                    return Ok((StatusCode::OK, Json(to_json(&payment))));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            return Err(AppError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "idempotency_conflict",
+                "concurrent request conflict, please retry",
+            ));
         }
     }
 
     let memo = generate_unique_memo(&state.pool).await?;
-    let id = Uuid::new_v4().to_string();
 
     let payment = db::create_payment(
         &state.pool,
@@ -199,18 +231,6 @@ pub async fn create(
         },
     )
     .await?;
-
-    /* Persist the key → payment mapping. If a concurrent request won the race,
-    `save_idempotency_key` returns the canonical id; return that payment so
-    both retries converge on a single intent. */
-    if let Some(key) = idempotency_key {
-        let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
-        if canonical_id != id {
-            if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
-                return Ok((StatusCode::OK, Json(to_json(&payment))));
-            }
-        }
-    }
 
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }

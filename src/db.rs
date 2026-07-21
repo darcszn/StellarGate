@@ -502,15 +502,27 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     Ok(row.as_ref().map(row_to_payment))
 }
 
+/// Transition a payment to a new status, returning `true` when the row was
+/// actually updated.
+///
+/// The `WHERE … AND status IN ('pending', 'underpaid')` guard is the key to
+/// single-settlement under concurrent reconciliation (issue #155): SQLite's
+/// serialized write path ensures that exactly one of two racing UPDATE
+/// statements will match a row still in a watchable state. The loser sees
+/// `rows_affected() == 0` and knows it must skip the webhook.
 pub async fn update_payment_status(
     pool: &Db,
     id: &str,
     status: &str,
     tx_hash: &str,
     paid_amount: &str,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE payments SET status = ?, tx_hash = ?, paid_amount = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE payments
+            SET status = ?, tx_hash = ?, paid_amount = ?,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id = ?
+            AND status IN ('pending', 'underpaid')",
     )
     .bind(status)
     .bind(tx_hash)
@@ -518,7 +530,7 @@ pub async fn update_payment_status(
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Read a value from the durable key/value state table, if present.

@@ -149,7 +149,7 @@ impl Config {
         };
 
         let config = Self {
-            port: parse_env("PORT", 3000),
+            port: parse_env("PORT", 3000)?,
             database_url,
             network,
             horizon_url,
@@ -175,7 +175,7 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             ),
-            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false),
+            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
         };
         config.validate_addresses()?;
@@ -285,18 +285,26 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Parse an env var into `T`, falling back to `default` (and warning) when the
-/// variable is set but unparseable, so a typo never silently breaks behaviour.
-fn parse_env<T>(key: &str, default: T) -> T
+/// Parse an env var into `T`.
+///
+/// - If the variable is absent, `default` is returned.
+/// - If the variable is present but cannot be parsed, boot is aborted with a
+///   clear error message instead of silently falling back to the default.
+///   This prevents misconfigured values (e.g. a typo in `PAYMENT_TTL_SECS`)
+///   from going unnoticed in production.
+fn parse_env<T>(key: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
     match std::env::var(key) {
-        Ok(raw) => raw.parse().unwrap_or_else(|_| {
-            tracing::warn!("invalid value for {key}={raw:?}, using default");
-            default
+        Ok(raw) => raw.parse::<T>().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid value for {key}={raw:?}: {e}. \
+                 Fix the environment variable or remove it to use the default."
+            )
         }),
-        Err(_) => default,
+        Err(_) => Ok(default),
     }
 }
 
