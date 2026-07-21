@@ -480,7 +480,7 @@ sqlx records applied migrations in a `_sqlx_migrations` table so each file is ru
 
 ## Contributing
 
-This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up.
+This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up, and read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, standards, and the PR process. Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 **To contribute:**
 
@@ -489,6 +489,8 @@ This project is open to contributors. See the [Wave Program](https://github.com/
 3. Make your changes and add tests
 4. Run `cargo test` — all tests must pass
 5. Open a pull request
+
+Found a security vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
 
 ## License
 
