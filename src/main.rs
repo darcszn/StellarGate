@@ -7,7 +7,7 @@ use std::time::Duration;
 use stellargate::{
     api,
     config::{Config, ListenerMode},
-    db, expiry, horizon, AppState,
+    db, expiry, horizon, webhook, AppState,
 };
 use tokio::sync::watch;
 use tracing::info;
@@ -70,7 +70,8 @@ async fn main() -> Result<()> {
         None
     };
     let poller_handle = tokio::spawn(horizon::run_poller(state.clone(), shutdown_rx.clone()));
-    let sweeper_handle = tokio::spawn(expiry::run_sweeper(state.clone(), shutdown_rx));
+    let sweeper_handle = tokio::spawn(expiry::run_sweeper(state.clone(), shutdown_rx.clone()));
+    let redrive_handle = tokio::spawn(webhook::run_redrive_worker(state.clone(), shutdown_rx));
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -89,6 +90,7 @@ async fn main() -> Result<()> {
     let bg = async {
         let _ = poller_handle.await;
         let _ = sweeper_handle.await;
+        let _ = redrive_handle.await;
         if let Some(h) = stream_handle {
             let _ = h.await;
         }

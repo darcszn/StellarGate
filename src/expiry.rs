@@ -55,3 +55,184 @@ pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<boo
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AcceptedAsset, Config, ListenerMode};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_config(webhook_url_allowed: bool) -> Config {
+        Config {
+            port: 0,
+            database_url: "sqlite::memory:".into(),
+            network: "testnet".into(),
+            horizon_url: String::new(),
+            gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
+            gateway_secret: String::new(),
+            accepted_assets: AcceptedAsset::default_list(),
+            webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
+            webhook_retry_attempts: 1,
+            webhook_retry_delay_ms: 0,
+            webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
+            poll_interval_secs: 10,
+            payment_ttl_secs: 3600,
+            rate_limit_requests_per_sec: 1000,
+            db_pool_max_connections: 5,
+            db_busy_timeout_ms: 5000,
+            cors_allowed_origins: vec![],
+            listener_mode: ListenerMode::Poll,
+            // Allow loopback targets so tests can dispatch to a wiremock server.
+            webhook_allow_private_targets: webhook_url_allowed,
+            admin_provisioning_secret: String::new(),
+        }
+    }
+
+    async fn memory_state(cfg: Config) -> AppState {
+        let pool = SqlitePoolOptions::new()
+            .connect_with(
+                SqliteConnectOptions::from_str(&cfg.database_url)
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        db::migrate(&pool).await.unwrap();
+        AppState {
+            pool,
+            config: cfg,
+            http: reqwest::Client::new(),
+            webhook_http: reqwest::Client::new(),
+        }
+    }
+
+    /// End-to-end coverage for the `payment.expired` webhook: an overdue
+    /// intent swept by `sweep_once` must fire a real, correctly-signed HTTP
+    /// POST to the merchant's webhook endpoint (issue #156 — this path had no
+    /// test beyond the sweeper's own DB-level unit tests).
+    #[tokio::test]
+    async fn sweep_fires_payment_expired_webhook_end_to_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = Arc::new(memory_state(test_config(true)).await);
+        let webhook_url = format!("{}/hook", server.uri());
+        let payment = db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_expiring",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "EXPMEMO",
+                amount: "10",
+                asset: "XLM",
+                webhook_url: Some(&webhook_url),
+                // Already overdue: sweep_once must expire it immediately.
+                ttl_secs: -10,
+            },
+        )
+        .await
+        .unwrap();
+
+        let expired_count = sweep_once(&state).await.unwrap();
+        assert_eq!(expired_count, 1, "the overdue intent must be swept");
+
+        let updated = db::get_payment(&state.pool, &payment.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "expired");
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one webhook POST must be sent");
+        let req = &received[0];
+        assert_eq!(
+            req.headers.get("X-StellarGate-Event").unwrap(),
+            EXPIRED_EVENT
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["event"], EXPIRED_EVENT);
+        assert_eq!(body["payment_id"], payment.id);
+        assert_eq!(body["status"], "expired");
+
+        // The signature is valid over the body the mock server actually received.
+        let timestamp: i64 = req
+            .headers
+            .get("X-StellarGate-Timestamp")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let expected_sig = crate::webhook::sign(&state.config.webhook_secret, timestamp, &req.body);
+        assert_eq!(
+            req.headers
+                .get("X-StellarGate-Signature")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected_sig
+        );
+
+        let deliveries = db::list_webhook_deliveries(&state.pool, &payment.id)
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].status, "delivered");
+        assert_eq!(deliveries[0].event(), EXPIRED_EVENT);
+    }
+
+    /// A second sweep after the webhook already fired must not re-expire (and
+    /// therefore not re-notify) the same intent.
+    #[tokio::test]
+    async fn sweep_is_idempotent_and_does_not_redeliver() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = Arc::new(memory_state(test_config(true)).await);
+        let webhook_url = format!("{}/hook", server.uri());
+        db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_expiring_once",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "EXPMEMOONCE",
+                amount: "10",
+                asset: "XLM",
+                webhook_url: Some(&webhook_url),
+                ttl_secs: -10,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(sweep_once(&state).await.unwrap(), 1);
+        assert_eq!(sweep_once(&state).await.unwrap(), 0);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "a second sweep must not re-fire the expiry webhook"
+        );
+    }
+}

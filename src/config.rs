@@ -90,6 +90,24 @@ pub struct Config {
     /// Defaults to 10 seconds — short enough to keep retries responsive while
     /// giving receivers a fair window to process the request.
     pub webhook_timeout_secs: u64,
+    /// How often (seconds) the background redrive worker scans for stuck
+    /// webhook deliveries (`pending`/`failed` rows left behind by a process
+    /// that exited mid-delivery, or a receiver that was down when retries
+    /// were exhausted). The worker's first pass runs immediately on startup,
+    /// so a restart redrives without waiting a full interval.
+    pub webhook_redrive_interval_secs: u64,
+    /// Maximum number of redrive HTTP attempts in flight at once.
+    pub webhook_redrive_concurrency: usize,
+    /// Total attempts (inline + redrive) before a delivery is left `failed`
+    /// permanently.
+    pub webhook_redrive_max_attempts: u32,
+    /// How long (seconds) a delivery must sit idle since its last attempt (or
+    /// creation) before the redrive worker will touch it. Must comfortably
+    /// exceed the worst-case inline delivery time
+    /// (`webhook_retry_attempts * (webhook_timeout_secs + webhook_retry_delay_ms)`)
+    /// so the worker never races a `dispatch()` call that is still in flight
+    /// for the same row.
+    pub webhook_redrive_grace_secs: i64,
     pub poll_interval_secs: u64,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
@@ -338,6 +356,22 @@ impl std::fmt::Debug for Config {
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
             .field("webhook_timeout_secs", &self.webhook_timeout_secs)
+            .field(
+                "webhook_redrive_interval_secs",
+                &self.webhook_redrive_interval_secs,
+            )
+            .field(
+                "webhook_redrive_concurrency",
+                &self.webhook_redrive_concurrency,
+            )
+            .field(
+                "webhook_redrive_max_attempts",
+                &self.webhook_redrive_max_attempts,
+            )
+            .field(
+                "webhook_redrive_grace_secs",
+                &self.webhook_redrive_grace_secs,
+            )
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
             .field(
@@ -403,6 +437,10 @@ mod tests {
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,
@@ -473,6 +511,10 @@ mod tests {
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
             webhook_timeout_secs: 10,
+            webhook_redrive_interval_secs: 30,
+            webhook_redrive_concurrency: 4,
+            webhook_redrive_max_attempts: 8,
+            webhook_redrive_grace_secs: 60,
             poll_interval_secs: 10,
             payment_ttl_secs: 3600,
             rate_limit_requests_per_sec: 10,

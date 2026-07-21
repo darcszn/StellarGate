@@ -657,6 +657,40 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
     }
 }
 
+/// Deliveries eligible for the background redrive worker: not yet delivered,
+/// under the attempt cap, and idle long enough that no in-flight `dispatch()`
+/// call for the same row can still be running.
+///
+/// A delivery row's status only changes at the *end* of a `dispatch()` call
+/// (success, final failure, or an SSRF rejection); while an attempt is still
+/// in progress the row stays `pending` with no signal that work is under way.
+/// `grace_secs` is the idle window past `last_attempt` (or `created_at` for a
+/// row never attempted) that a row must clear before being considered stuck
+/// rather than merely in flight — callers must size it comfortably above the
+/// worst-case inline delivery time so this worker never races a live
+/// `dispatch()` for the same row.
+pub async fn list_redrivable_deliveries(
+    pool: &Db,
+    max_attempts: i64,
+    grace_secs: i64,
+) -> Result<Vec<WebhookDelivery>> {
+    let grace_modifier = format!("-{grace_secs} seconds");
+    let rows = sqlx::query(
+        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+         FROM webhook_deliveries
+         WHERE status IN ('pending', 'failed')
+           AND attempts < ?
+           AND COALESCE(last_attempt, created_at) <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+         ORDER BY created_at ASC",
+    )
+    .bind(max_attempts)
+    .bind(&grace_modifier)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
     let rows = sqlx::query(
@@ -847,5 +881,82 @@ mod tests {
 
         // A second sweep is a no-op — nothing is double-reported.
         assert_eq!(expire_overdue(&pool).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_excludes_delivered_and_over_cap() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR1", 3600))
+            .await
+            .unwrap();
+
+        save_webhook_delivery(
+            &pool,
+            "delivered",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        update_webhook_delivery(&pool, "delivered", "delivered", 1)
+            .await
+            .unwrap();
+
+        save_webhook_delivery(
+            &pool,
+            "over-cap",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        update_webhook_delivery(&pool, "over-cap", "failed", 8)
+            .await
+            .unwrap();
+
+        save_webhook_delivery(
+            &pool,
+            "eligible",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+
+        let candidates = list_redrivable_deliveries(&pool, 8, 0).await.unwrap();
+        let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["eligible"],
+            "only the pending row under the attempt cap must be redrivable"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_respects_grace_window() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR2", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(&pool, "fresh", "p1", "http://x", "{}", "payment.completed")
+            .await
+            .unwrap();
+
+        // Freshly inserted, so a large grace window makes it ineligible...
+        assert!(list_redrivable_deliveries(&pool, 8, 3600)
+            .await
+            .unwrap()
+            .is_empty());
+        // ...while a zero grace window makes it immediately eligible.
+        assert_eq!(
+            list_redrivable_deliveries(&pool, 8, 0).await.unwrap().len(),
+            1
+        );
     }
 }

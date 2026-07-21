@@ -77,6 +77,10 @@ cp .env.example .env
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
 | `WEBHOOK_RETRY_DELAY_MS` | Delay between webhook retries | `5000` |
 | `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout (seconds) for outbound webhook POSTs. Each retry is bounded independently; a slow receiver cannot block the reconciler for longer than this value × retries. | `10` |
+| `WEBHOOK_REDRIVE_INTERVAL_SECS` | How often the background redrive worker scans for stuck webhook deliveries (rows left `pending`/`failed` by a process that exited mid-delivery). Its first pass runs immediately on startup, so a restart redrives without waiting a full interval. | `30` |
+| `WEBHOOK_REDRIVE_CONCURRENCY` | Maximum redrive HTTP attempts in flight at once. | `4` |
+| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left `failed` permanently. | `8` |
+| `WEBHOOK_REDRIVE_GRACE_SECS` | How long (seconds) a delivery must sit idle since its last attempt before the redrive worker will touch it, so it never races a still-in-flight inline delivery for the same row. | `60` |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF guard's loopback/link-local/private/reserved IP check on `webhook_url` (still requires http(s) and a resolvable host). For local development and tests only — never enable in production. | `false` |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated allowed CORS origins (e.g. `https://app.example.com`). Required on `public` network; omitting on testnet falls back to permissive with a warning. | _(unset — permissive on testnet)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Rate limit for `POST /payments` and `POST /merchants` (requests per second per IP, tracked independently per route) | `10` |
@@ -458,7 +462,7 @@ src/
 ├── strkey.rs        # Stellar address (strkey) validation
 ├── horizon.rs       # Horizon polling listener + payment verification
 ├── expiry.rs        # Background sweeper that expires overdue pending intents
-├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
+├── webhook.rs       # HMAC-SHA256 signed webhook dispatch + background redrive worker
 └── api/
     ├── mod.rs       # Axum router, layers (CORS/trace/body-limit), 404 fallback
     └── payments.rs  # Payment handlers (create, get, list)
@@ -481,7 +485,7 @@ sqlx records applied migrations in a `_sqlx_migrations` table so each file is ru
 
 ## Contributing
 
-This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up.
+This project is open to contributors. See the [Wave Program](https://github.com/StellarGateLabs/StellarGate/issues) for scoped issues you can pick up, and read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, standards, and the PR process. Participation is governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 **To contribute:**
 
@@ -490,6 +494,8 @@ This project is open to contributors. See the [Wave Program](https://github.com/
 3. Make your changes and add tests
 4. Run `cargo test` — all tests must pass
 5. Open a pull request
+
+Found a security vulnerability? Please report it privately — see [SECURITY.md](SECURITY.md).
 
 ## License
 
