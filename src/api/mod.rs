@@ -54,6 +54,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/", get(|| async { "StellarGate API v0.1.0" }))
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics_handler))
         /* Merchant provisioning — returns a one-time plaintext API key. Gated
         behind ADMIN_PROVISIONING_SECRET so it can't be used to mint
         unlimited credentials anonymously. */
@@ -322,6 +323,19 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+/// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = crate::metrics::render(&state.webhook_metrics);
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
 }
 
 async fn not_found() -> impl IntoResponse {
