@@ -2,6 +2,7 @@
 name = "stellargate"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 
 description = "A Rust toolkit for building on the Stellar blockchain"
 repository = "https://github.com/StellarGateLabs/StellarGate"
