@@ -92,6 +92,7 @@ mod tests {
             // Allow loopback targets so tests can dispatch to a wiremock server.
             webhook_allow_private_targets: webhook_url_allowed,
             admin_provisioning_secret: String::new(),
+            request_timeout_secs: 30,
         }
     }
 
