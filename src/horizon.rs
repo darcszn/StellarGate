@@ -107,6 +107,26 @@ struct Embedded {
     records: Vec<HorizonPayment>,
 }
 
+/// The gateway account as returned by Horizon's `/accounts/{id}` endpoint. We
+/// only care about its balance lines, which double as its trustlines: a
+/// non-native asset appears here only if the account trusts that issuer.
+#[derive(Debug, Deserialize)]
+struct AccountResponse {
+    #[serde(default)]
+    balances: Vec<AccountBalance>,
+}
+
+/// One balance / trustline line on a Stellar account.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountBalance {
+    #[serde(default)]
+    pub asset_type: Option<String>,
+    #[serde(default)]
+    pub asset_code: Option<String>,
+    #[serde(default)]
+    pub asset_issuer: Option<String>,
+}
+
 /// The outcome of matching a Horizon payment against a pending intent.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -260,6 +280,69 @@ pub async fn fetch_recent_payments(
         .json()
         .await?;
     Ok(page.embedded.records)
+}
+
+/// Return the accepted assets the gateway account holds **no** trustline for.
+///
+/// Native XLM never needs a trustline, so it is always considered held. An
+/// issued asset (`CODE:ISSUER`) is held only if the account has a balance line
+/// with the matching `asset_code` and `asset_issuer`. Pure, so it is
+/// unit-tested without any network.
+pub fn missing_trustlines<'a>(
+    accepted_assets: &'a [crate::config::AcceptedAsset],
+    balances: &[AccountBalance],
+) -> Vec<&'a crate::config::AcceptedAsset> {
+    accepted_assets
+        .iter()
+        .filter(|asset| match asset.issuer.as_deref() {
+            // Native asset — no trustline required.
+            None => false,
+            Some(issuer) => !balances.iter().any(|b| {
+                b.asset_code.as_deref() == Some(asset.code.as_str())
+                    && b.asset_issuer.as_deref() == Some(issuer)
+            }),
+        })
+        .collect()
+}
+
+/// At startup, check that the gateway account holds a trustline for every
+/// accepted non-native asset, and warn about any that are missing.
+///
+/// An accepted asset without a trustline mints unpayable intents: the gateway
+/// advertises (say) USDC, a customer pays, and the payment bounces on-chain
+/// because the account cannot receive it. Surfacing this at boot turns a silent
+/// runtime failure into an actionable startup warning.
+///
+/// Best-effort by design: a Horizon error (unreachable, account not yet funded)
+/// is returned to the caller to log, but must not abort boot — the account may
+/// be provisioned shortly after start. Returns the list of accepted asset codes
+/// that are missing a trustline (empty when all are present).
+pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<String>> {
+    let url = format!(
+        "{}/accounts/{}",
+        state.config.horizon_url.trim_end_matches('/'),
+        state.config.gateway_public,
+    );
+    let account: AccountResponse = state
+        .http
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let missing = missing_trustlines(&state.config.accepted_assets, &account.balances);
+    for asset in &missing {
+        warn!(
+            asset = %asset.code,
+            issuer = %asset.issuer.as_deref().unwrap_or(""),
+            "gateway account has no trustline for an accepted asset; intents in \
+             this asset will be unpayable until a trustline is established"
+        );
+    }
+    Ok(missing.iter().map(|a| a.code.clone()).collect())
 }
 
 /// Resolve the cursor this cycle should start paging from.
@@ -952,6 +1035,58 @@ mod tests {
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = None;
         assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+    }
+
+    fn native_balance() -> AccountBalance {
+        AccountBalance {
+            asset_type: Some("native".into()),
+            asset_code: None,
+            asset_issuer: None,
+        }
+    }
+
+    fn issued_balance(code: &str, issuer: &str) -> AccountBalance {
+        AccountBalance {
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some(code.into()),
+            asset_issuer: Some(issuer.into()),
+        }
+    }
+
+    #[test]
+    fn missing_trustlines_flags_untrusted_issued_asset() {
+        // Accepts XLM (native) and USDC:GUSDC, but the account holds only XLM.
+        let assets = test_assets();
+        let missing = missing_trustlines(&assets, &[native_balance()]);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].code, "USDC");
+    }
+
+    #[test]
+    fn missing_trustlines_none_when_all_assets_trusted() {
+        let balances = [native_balance(), issued_balance("USDC", "GUSDC")];
+        assert!(missing_trustlines(&test_assets(), &balances).is_empty());
+    }
+
+    #[test]
+    fn missing_trustlines_requires_the_matching_issuer() {
+        // Right code, wrong issuer — the trustline is still considered missing.
+        let assets = test_assets();
+        let balances = [issued_balance("USDC", "GWRONGISSUER")];
+        let missing = missing_trustlines(&assets, &balances);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].code, "USDC");
+    }
+
+    #[test]
+    fn missing_trustlines_never_flags_native_xlm() {
+        // An XLM-only gateway with no balance lines at all still needs no
+        // trustline for its native asset.
+        let assets = [crate::config::AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }];
+        assert!(missing_trustlines(&assets, &[]).is_empty());
     }
 
     #[test]

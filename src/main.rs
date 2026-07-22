@@ -55,6 +55,27 @@ async fn main() -> Result<()> {
         webhook_http,
     });
 
+    /* Verify the gateway account can actually receive every accepted asset.
+    A missing trustline mints unpayable intents, so surface it loudly at boot
+    rather than letting payments silently bounce on-chain. Best-effort: a
+    Horizon hiccup (or a not-yet-funded account) must not block startup. */
+    if cfg.gateway_configured() {
+        match horizon::check_trustlines(&state).await {
+            Ok(missing) if missing.is_empty() => {
+                info!("gateway trustlines verified for all accepted assets");
+            }
+            Ok(missing) => {
+                info!(
+                    missing = ?missing,
+                    "startup trustline check found accepted assets with no trustline"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not verify gateway trustlines at startup");
+            }
+        }
+    }
+
     // Broadcast shutdown to all background tasks.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
