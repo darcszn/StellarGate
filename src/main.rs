@@ -7,7 +7,9 @@ use std::time::Duration;
 use stellargate::{
     api,
     config::{Config, ListenerMode},
-    db, expiry, horizon, webhook, AppState,
+    db, expiry, horizon,
+    metrics::WebhookMetrics,
+    webhook, AppState,
 };
 use tokio::sync::watch;
 use tracing::info;
@@ -53,6 +55,7 @@ async fn main() -> Result<()> {
         config: cfg.clone(),
         http,
         webhook_http,
+        webhook_metrics: WebhookMetrics::new(),
     });
 
     /* Verify the gateway account can actually receive every accepted asset.
