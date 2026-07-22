@@ -35,10 +35,21 @@ jobs:
       # Fails the job if any dependency has a known RustSec advisory.
       # --deny warnings escalates unmaintained/unsound advisories to errors.
       #
-      # RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`) is ignored: `rsa`
-      # is pulled in only via sqlx's unused MySQL backend (we enable the `sqlite`
-      # feature only), so the vulnerable code is never compiled. No fixed `rsa`
-      # release exists yet. Kept in sync with the ignore list in deny.toml.
+      # TEMPORARY IGNORE — RUSTSEC-2023-0071 (Marvin timing side-channel in
+      # `rsa`). `rsa` is pulled in only via sqlx's unused MySQL backend (we
+      # enable the `sqlite` feature only), so the vulnerable code is never
+      # compiled. It is flagged because it still appears in Cargo.lock.
+      #
+      # This is a tracked, time-boxed exception, NOT a permanent waiver. Remove
+      # the `--ignore` flag as soon as any removal condition is met:
+      #   * a fixed `rsa` release ships, or
+      #   * `rsa` leaves the dependency tree, or
+      #   * we start enabling sqlx's MySQL backend (then it needs a real fix).
+      # Review by: 2026-10-22 (quarterly). Tracking issue: StellarGateLabs#154.
+      # Rationale + removal conditions are kept in sync in deny.toml.
+      #
+      # The weekly `schedule:` cron above re-runs this audit against a fresh
+      # advisory DB, so a newly-published fix surfaces without a code change.
       - name: Run cargo audit
         run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
 

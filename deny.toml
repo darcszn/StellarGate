@@ -11,12 +11,33 @@ version = 2
 # advisories — a supply-chain risk for a payments service.
 unmaintained = "all"
 # Advisories that are acknowledged and accepted, with justification.
+#
+# Every entry here is a temporary exception, not a permanent waiver. Each must
+# carry a removal condition and a review date, and is re-examined on the
+# schedule below (see also the weekly `cargo audit` cron in
+# .github/workflows/supply-chain.yml). Remove an entry as soon as its removal
+# condition is met.
 ignore = [
-    # RUSTSEC-2023-0071 (Marvin timing side-channel in `rsa`). `rsa` is pulled
-    # in only via sqlx's MySQL backend, which we do not enable — we depend on
-    # `sqlx` with the `sqlite` feature only, so the vulnerable code is never
-    # compiled or executed. No fixed `rsa` release is available yet.
-    "RUSTSEC-2023-0071",
+    # RUSTSEC-2023-0071 — Marvin timing side-channel in `rsa`.
+    #
+    # Why ignored: `rsa` is pulled in only through sqlx's MySQL backend
+    # (`sqlx-mysql`), which we do not enable — we depend on `sqlx` with the
+    # `sqlite` feature only, so the vulnerable code is never compiled or
+    # executed. It appears in Cargo.lock (and is therefore flagged by the
+    # advisory scanners, which read the lockfile) purely as an optional,
+    # unbuilt transitive dependency.
+    #
+    # Removal condition — drop this ignore as soon as ANY of these holds:
+    #   1. A fixed `rsa` release is published (track RustSec advisory
+    #      RUSTSEC-2023-0071 and https://github.com/RustCrypto/RSA/issues/19).
+    #   2. `rsa` leaves the dependency tree entirely (e.g. sqlx removes the
+    #      transitive path, or we drop the MySQL backend from resolution).
+    #   3. StellarGate begins enabling sqlx's MySQL backend — in which case the
+    #      code IS reachable and this must become a real fix, not an ignore.
+    #
+    # Review by: 2026-10-22 (quarterly). Tracking issue: StellarGateLabs#154.
+    # Keep in sync with the `--ignore` flag in supply-chain.yml.
+    { id = "RUSTSEC-2023-0071", reason = "rsa reachable only via sqlx's unenabled MySQL backend; no fixed release yet. Remove when fixed/removed upstream. Review by 2026-10-22. See StellarGateLabs#154." },
 ]
 
 # ── Licenses ──────────────────────────────────────────────────────────────────
