@@ -1,5 +1,5 @@
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
-FROM rust:1.82-bookworm AS chef
+FROM rust:1.75-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -18,7 +18,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -u 1001 -U stellargate \

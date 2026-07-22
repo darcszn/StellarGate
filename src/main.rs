@@ -8,7 +8,7 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{TaskHealth, WebhookMetrics},
+    metrics::WebhookMetrics,
     webhook, AppState,
 };
 use tokio::sync::watch;
@@ -52,7 +52,6 @@ async fn main() -> Result<()> {
         http,
         webhook_http,
         webhook_metrics: WebhookMetrics::new(),
-        task_health: TaskHealth::new(),
     });
 
     if cfg.gateway_configured() {
@@ -71,6 +70,9 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // Each background task is wrapped so task_started/task_stopped keep the
+    // healthy gauge accurate. Panics are caught at join time and recorded via
+    // task_failed so the failure counter (and its alert) fires.
     let stream_handle = if cfg.listener_mode == ListenerMode::Stream {
         let th = state.task_health.clone();
         th.task_started();
@@ -89,26 +91,36 @@ async fn main() -> Result<()> {
         th.task_started();
         let s = state.clone();
         let rx = shutdown_rx.clone();
-        tokio::spawn(async move { horizon::run_poller(s, rx).await; th.task_stopped(); })
+        tokio::spawn(async move {
+            horizon::run_poller(s, rx).await;
+            th.task_stopped();
+        })
     };
     let sweeper_handle = {
         let th = state.task_health.clone();
         th.task_started();
         let s = state.clone();
         let rx = shutdown_rx.clone();
-        tokio::spawn(async move { expiry::run_sweeper(s, rx).await; th.task_stopped(); })
+        tokio::spawn(async move {
+            expiry::run_sweeper(s, rx).await;
+            th.task_stopped();
+        })
     };
     let redrive_handle = {
         let th = state.task_health.clone();
         th.task_started();
         let s = state.clone();
-        tokio::spawn(async move { webhook::run_redrive_worker(s, shutdown_rx).await; th.task_stopped(); })
+        tokio::spawn(async move {
+            webhook::run_redrive_worker(s, shutdown_rx).await;
+            th.task_stopped();
+        })
     };
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
 
+    // Clone before state is moved into the router.
     let task_health = state.task_health.clone();
 
     axum::serve(
@@ -121,6 +133,8 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(true);
     let timeout = Duration::from_secs(30);
     let bg = async move {
+        // A JoinError means the task panicked — record it so the healthy gauge
+        // and failure counter both reflect the crash and can fire an alert.
         macro_rules! join_task {
             ($handle:expr) => {
                 if let Err(e) = $handle.await {
@@ -130,6 +144,12 @@ async fn main() -> Result<()> {
                     }
                 }
             };
+        }
+        join_task!(poller_handle);
+        join_task!(sweeper_handle);
+        join_task!(redrive_handle);
+        if let Some(h) = stream_handle {
+            join_task!(h);
         }
         join_task!(poller_handle);
         join_task!(sweeper_handle);

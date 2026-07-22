@@ -140,7 +140,10 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     let start = Instant::now();
 
     for attempt in 1..=attempts {
-        if attempt > 1 { state.webhook_metrics.record_retry(); }
+        // Every attempt after the first is a retry — record it.
+        if attempt > 1 {
+            state.webhook_metrics.record_retry();
+        }
 
         let result = client
             .post(&url)
@@ -157,12 +160,19 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
                 info!(payment_id = %payment.id, %url, attempt, "webhook delivered");
                 state.webhook_metrics.record_delivered();
                 state.webhook_metrics.record_latency_ms(start.elapsed().as_millis() as u64);
-                let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "delivered", attempt as i64).await;
+                let _ = db::update_webhook_delivery(
+                    &state.pool,
+                    &delivery_id,
+                    "delivered",
+                    attempt as i64,
+                )
+                .await;
                 return;
             }
             Ok(resp) => { warn!(payment_id = %payment.id, status = %resp.status(), attempt, "webhook rejected"); }
-            Err(e)   => { warn!(payment_id = %payment.id, error = %e, attempt, "webhook request failed"); }
+            Err(e) => { warn!(payment_id = %payment.id, error = %e, attempt, "webhook request failed"); }
         }
+
         if attempt < attempts { tokio::time::sleep(delay).await; }
     }
 
@@ -261,6 +271,8 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
     let timestamp = current_timestamp();
     let signature = sign(&state.config.webhook_secret, timestamp, body);
     let start = Instant::now();
+
+    // Every redrive attempt is effectively a retry.
     state.webhook_metrics.record_retry();
 
     let result = client

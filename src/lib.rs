@@ -17,6 +17,8 @@ pub struct AppState {
     pub config: config::Config,
     pub http: reqwest::Client,
     pub webhook_http: reqwest::Client,
+    /// Webhook delivery metrics: delivered/failed/retried counts and a latency
+    /// histogram. Exposed via `GET /metrics` so operators can see delivery
+    /// success rate, retry volume, and failure spikes at a glance.
     pub webhook_metrics: metrics::WebhookMetrics,
-    pub task_health: metrics::TaskHealth,
 }

@@ -12,14 +12,22 @@ pub enum ListenerMode {
 }
 
 impl ListenerMode {
-    fn parse(raw: &str) -> Self {
+    /// Parse `STELLAR_LISTENER_MODE` from a raw env-var value.
+    ///
+    /// - Empty / unset → defaults to `Stream` (no error).
+    /// - `"stream"` or `"poll"` (case-insensitive) → the chosen mode.
+    /// - Any other non-empty value → `Err`, which aborts boot with a clear
+    ///   message rather than silently falling back to a different mode.
+    fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "poll" => Self::Poll,
-            "stream" => Self::Stream,
-            other => {
-                tracing::warn!("invalid STELLAR_LISTENER_MODE={other:?}, using \"stream\"");
-                Self::Stream
-            }
+            "" => Ok(Self::Stream),
+            "stream" => Ok(Self::Stream),
+            "poll" => Ok(Self::Poll),
+            other => Err(anyhow::anyhow!(
+                "STELLAR_LISTENER_MODE={other:?} is not a recognised value. \
+                 Valid values are \"stream\" or \"poll\". \
+                 Fix the environment variable or remove it to use the default (\"stream\")."
+            )),
         }
     }
 }
@@ -151,7 +159,10 @@ impl Config {
             .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
-        let gateway_secret = std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default();
+        let gateway_secret = Self::validate_gateway_secret(
+            std::env::var("STELLAR_GATEWAY_SECRET").unwrap_or_default(),
+            &gateway_public,
+        )?;
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
 
         let cors_allowed_origins: Vec<String> = {
@@ -208,7 +219,7 @@ impl Config {
             cors_allowed_origins,
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
-            ),
+            )?,
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
@@ -330,15 +341,66 @@ impl Config {
                 "WEBHOOK_SECRET cannot contain only whitespace"
             ));
         }
-        if secret == "default-secret" {
+        // Reject known placeholder values that might be copied verbatim from
+        // .env.example or documentation.
+        const WEBHOOK_PLACEHOLDERS: &[&str] = &[
+            "default-secret",
+            "your_webhook_signing_secret",
+            "REPLACE_ME_webhook_signing_secret",
+        ];
+        if WEBHOOK_PLACEHOLDERS.contains(&secret.as_str()) || secret.starts_with("REPLACE_ME_") {
             return Err(anyhow::anyhow!(
-                "WEBHOOK_SECRET cannot equal \"default-secret\""
+                "WEBHOOK_SECRET is set to a known placeholder value ({:?}). \
+                 Replace it with a strong, randomly-generated secret.",
+                secret
             ));
         }
         if secret.len() < 32 {
             return Err(anyhow::anyhow!(
                 "WEBHOOK_SECRET must be at least 32 characters long (got {})",
                 secret.len()
+            ));
+        }
+
+        Ok(secret)
+    }
+
+    /// Validate `STELLAR_GATEWAY_SECRET` at boot.
+    ///
+    /// - Empty is allowed when the gateway public key is also unconfigured
+    ///   (development / read-only mode).
+    /// - The placeholder value from `.env.example` (`SXXX…` or `REPLACE_ME_*`) is always
+    ///   rejected — it would silently sign nothing but gives operators false
+    ///   confidence that the key is set.
+    fn validate_gateway_secret(secret: String, gateway_public: &str) -> Result<String> {
+        let configured = !gateway_public.is_empty() && gateway_public != "UNCONFIGURED";
+
+        // Reject the classic .env.example placeholder: starts with 'S' and
+        // the rest are all 'X's (e.g. SXXXXXXX…56 chars).
+        if !secret.is_empty()
+            && secret.starts_with('S')
+            && secret.chars().skip(1).all(|c| c == 'X')
+        {
+            return Err(anyhow::anyhow!(
+                "STELLAR_GATEWAY_SECRET is set to a placeholder value from .env.example. \
+                 Replace it with your real Stellar secret key."
+            ));
+        }
+
+        // Reject any REPLACE_ME_ placeholder.
+        if secret.starts_with("REPLACE_ME_") {
+            return Err(anyhow::anyhow!(
+                "STELLAR_GATEWAY_SECRET is set to a placeholder value ({:?}). \
+                 Replace it with your real Stellar secret key.",
+                secret
+            ));
+        }
+
+        // If a real public key has been configured, a secret key must also be present.
+        if configured && secret.is_empty() {
+            return Err(anyhow::anyhow!(
+                "STELLAR_GATEWAY_SECRET is required when STELLAR_GATEWAY_PUBLIC is set. \
+                 Set STELLAR_GATEWAY_SECRET to the corresponding secret key."
             ));
         }
 
@@ -598,7 +660,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("cannot equal \"default-secret\""),
+            err.contains("known placeholder value"),
             "got: {err}"
         );
     }
@@ -694,6 +756,10 @@ mod tests {
                 (
                     "STELLAR_GATEWAY_PUBLIC",
                     Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"),
+                ),
+                (
+                    "STELLAR_GATEWAY_SECRET",
+                    Some("SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN"),
                 ),
             ],
             || {
@@ -803,5 +869,78 @@ mod tests {
                 );
             },
         );
+    }
+
+    // ── ListenerMode::parse ──────────────────────────────────────────────────
+
+    #[test]
+    fn listener_mode_empty_defaults_to_stream() {
+        assert_eq!(ListenerMode::parse("").unwrap(), ListenerMode::Stream);
+    }
+
+    #[test]
+    fn listener_mode_stream_parses() {
+        assert_eq!(ListenerMode::parse("stream").unwrap(), ListenerMode::Stream);
+        assert_eq!(ListenerMode::parse("STREAM").unwrap(), ListenerMode::Stream);
+    }
+
+    #[test]
+    fn listener_mode_poll_parses() {
+        assert_eq!(ListenerMode::parse("poll").unwrap(), ListenerMode::Poll);
+        assert_eq!(ListenerMode::parse("POLL").unwrap(), ListenerMode::Poll);
+    }
+
+    #[test]
+    fn listener_mode_invalid_aborts_boot() {
+        let err = ListenerMode::parse("streem").unwrap_err().to_string();
+        assert!(
+            err.contains("STELLAR_LISTENER_MODE"),
+            "error should name the variable; got: {err}"
+        );
+        assert!(
+            err.contains("streem"),
+            "error should echo the bad value; got: {err}"
+        );
+    }
+
+    // ── validate_gateway_secret ──────────────────────────────────────────────
+
+    #[test]
+    fn gateway_secret_empty_allowed_when_unconfigured() {
+        let res = Config::validate_gateway_secret(String::new(), "UNCONFIGURED");
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn gateway_secret_placeholder_rejected() {
+        let placeholder = "S".to_string() + &"X".repeat(55);
+        let err = Config::validate_gateway_secret(placeholder, "UNCONFIGURED")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("placeholder value"), "got: {err}");
+    }
+
+    #[test]
+    fn gateway_secret_required_when_public_key_set() {
+        let err = Config::validate_gateway_secret(
+            String::new(),
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("STELLAR_GATEWAY_SECRET is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn gateway_secret_valid_accepted() {
+        // A real-looking secret key (not all-X after S)
+        let res = Config::validate_gateway_secret(
+            "SCZANGBA5RLKJHTBF4RJNRJMZWI4VKTHCRKOVAH7LRZZPZHHZWATAWBN".into(),
+            "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        );
+        assert!(res.is_ok());
     }
 }
