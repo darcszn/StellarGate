@@ -1,0 +1,13 @@
+.git
+.github
+target/
+*.db
+*.sqlite
+.env
+.env.*
+migrations/
+README.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+TODO.md

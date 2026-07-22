@@ -1,17 +1,19 @@
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
-FROM rust:1.82-bookworm AS chef
-RUN cargo install cargo-chef --locked
+FROM rust:1.88-bookworm AS chef
+RUN cargo install cargo-chef@0.1.68 --locked
 WORKDIR /app
 
 FROM chef AS planner
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build dependencies only — cached unless Cargo.toml/Cargo.lock change
-RUN cargo chef cook --release --locked --recipe-path recipe.json
-COPY . .
+# RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
 RUN cargo build --release --locked
 
 # ── Stage 2: slim runtime image ───────────────────────────────────────────────
