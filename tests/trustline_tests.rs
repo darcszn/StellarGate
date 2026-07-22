@@ -73,7 +73,6 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
-        task_health: stellargate::metrics::TaskHealth::new(),
     })
 }
 

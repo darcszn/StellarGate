@@ -55,7 +55,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics_handler))
-        .route("/deps", get(deps_health))
         /* Merchant provisioning — returns a one-time plaintext API key. Gated
         behind ADMIN_PROVISIONING_SECRET so it can't be used to mint
         unlimited credentials anonymously. */
@@ -326,35 +325,9 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-/// `GET /deps` — exposes per-dependency health and background-task gauges so
-/// operators can distinguish a DB failure from a task crash at a glance.
-/// Returns 503 when any dependency is unavailable or when any task has failed.
-async fn deps_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let db_ok = db::ping(&state.pool).await.is_ok();
-    let task_failures = state.task_health.failure_count();
-    let healthy_tasks = state.task_health.healthy_count();
-    let overall_ok = db_ok && task_failures == 0;
-
-    (
-        if overall_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
-        Json(json!({
-            "status": if overall_ok { "ok" } else { "degraded" },
-            "dependencies": {
-                "database": if db_ok { "ok" } else { "unavailable" },
-            },
-            "background_tasks": {
-                "healthy": healthy_tasks,
-                "failures": task_failures,
-            }
-        })),
-    )
-        .into_response()
-}
-
-/// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot covering
-/// webhook delivery counters/histogram and background-task health gauges.
+/// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = crate::metrics::render(&state.webhook_metrics, &state.task_health);
+    let body = crate::metrics::render(&state.webhook_metrics);
     (
         StatusCode::OK,
         [(

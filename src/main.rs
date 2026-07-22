@@ -8,7 +8,7 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{TaskHealth, WebhookMetrics},
+    metrics::WebhookMetrics,
     webhook, AppState,
 };
 use tokio::sync::watch;
@@ -52,7 +52,6 @@ async fn main() -> Result<()> {
         http,
         webhook_http,
         webhook_metrics: WebhookMetrics::new(),
-        task_health: TaskHealth::new(),
     });
 
     if cfg.gateway_configured() {

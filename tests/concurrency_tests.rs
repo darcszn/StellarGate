@@ -97,7 +97,6 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
-        task_health: stellargate::metrics::TaskHealth::new(),
     })
 }
 
