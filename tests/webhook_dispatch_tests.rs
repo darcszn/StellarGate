@@ -65,6 +65,7 @@ async fn setup_state(cfg: Config) -> AppState {
         config: cfg,
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
+        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
     }
 }
 
