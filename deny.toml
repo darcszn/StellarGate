@@ -67,16 +67,190 @@ allow = [
 # runtime-tokio-rustls, reqwest uses rustls-tls). openssl-sys is no longer in
 # the tree, and keeping the allowance would let it return unnoticed.
 
-# Crates that either bundle their own license text or use a non-SPDX
-# expression that cargo-deny cannot auto-classify. Add with justification.
-
 # ── Bans ──────────────────────────────────────────────────────────────────────
 [bans]
-# Warn when the same crate is resolved at multiple versions. Duplicates bloat
-# the binary and can mask version-sensitive security fixes.
-multiple-versions = "warn"
+# Deny any duplicate version that is not explicitly listed below. This turns
+# the allow-list into an enforced contract: adding a new transitive duplicate
+# breaks CI, forcing a conscious decision rather than silent bloat.
+multiple-versions = "deny"
 # Wildcard ("*") version requirements are allowed for now.
 wildcards = "allow"
+
+# Known duplicate versions as of 2026-08-20. Every entry below is a
+# transitively-forced version split that cannot be resolved without waiting for
+# upstream crates to unify on a single major. They are listed here so that
+# `multiple-versions = "deny"` above rejects any *new* unregistered duplicate
+# while keeping CI green for these known ones.
+#
+# Removal policy: when a dependency upgrade collapses two versions into one,
+# remove the corresponding skip entry so the policy tightens automatically.
+
+[[bans.skip]]
+# rand 0.8 required by sqlx; 0.9 by governor; 0.10 by newer transitive deps.
+# Collapse when sqlx and governor align on a single rand major.
+name = "rand"
+version = "=0.8.6"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.9.5"
+
+[[bans.skip]]
+# rand_chacha splits alongside rand majors.
+name = "rand_chacha"
+version = "=0.3.1"
+
+[[bans.skip]]
+# rand_core splits alongside rand majors.
+name = "rand_core"
+version = "=0.6.4"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.9.5"
+
+[[bans.skip]]
+# sha2 0.10 / digest 0.10 required by sqlx and hmac 0.12;
+# sha2 0.11 / digest 0.11 required by hmac 0.13 (pulled by newer crypto stack).
+name = "sha2"
+version = "=0.10.9"
+
+[[bans.skip]]
+# digest splits alongside sha2 majors.
+name = "digest"
+version = "=0.10.7"
+
+[[bans.skip]]
+# hmac 0.12 required by sqlx; 0.13 required by our direct dep (webhooks).
+name = "hmac"
+version = "=0.12.1"
+
+[[bans.skip]]
+# crypto-common splits alongside the RustCrypto digest/sha2 version bump.
+name = "crypto-common"
+version = "=0.1.7"
+
+[[bans.skip]]
+# block-buffer splits alongside the RustCrypto digest/sha2 version bump.
+name = "block-buffer"
+version = "=0.10.4"
+
+[[bans.skip]]
+# tower-http 0.6 required by axum 0.7; 0.7 is pulled by a newer transitive dep.
+# Collapse when axum bumps its tower-http requirement.
+name = "tower-http"
+version = "=0.6.11"
+
+[[bans.skip]]
+# getrandom 0.2 required by older rand/uuid transitive chain;
+# 0.3 and 0.4 by newer chains.
+name = "getrandom"
+version = "=0.2.17"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.3.4"
+
+[[bans.skip]]
+# hashbrown splits across multiple collections/indexmap majors.
+name = "hashbrown"
+version = "=0.14.5"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.15.5"
+
+[[bans.skip]]
+# http 0.2 required by older tower/hyper chain; 1.x by newer axum/hyper stack.
+name = "http"
+version = "=0.2.12"
+
+[[bans.skip]]
+# const-oid splits across the RustCrypto version bump.
+name = "const-oid"
+version = "=0.9.6"
+
+[[bans.skip]]
+# cpufeatures splits across the RustCrypto version bump.
+name = "cpufeatures"
+version = "=0.2.17"
+
+[[bans.skip]]
+# r-efi splits between two platform-abstraction crate generations.
+name = "r-efi"
+version = "=5.3.0"
+
+[[bans.skip]]
+# redox_syscall splits between older/newer Redox platform crates.
+name = "redox_syscall"
+version = "=0.5.18"
+
+[[bans.skip]]
+# syn 2 and 3 coexist due to different proc-macro crates being at different
+# migration stages. Collapse when all proc-macro deps unify on syn 3.
+name = "syn"
+version = "=2.0.117"
+
+[[bans.skip]]
+# thiserror 1.x required by older deps; 2.x by newer ones.
+name = "thiserror"
+version = "=1.0.69"
+
+[[bans.skip]]
+name = "thiserror-impl"
+version = "=1.0.69"
+
+[[bans.skip]]
+# webpki-roots 0.26 required by older rustls chain; 1.x by newer one.
+name = "webpki-roots"
+version = "=0.26.11"
+
+[[bans.skip]]
+# windows-sys 0.48/0.52 required by older winapi consumers; 0.61 by newer ones.
+name = "windows-sys"
+version = "=0.48.0"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.52.0"
+
+[[bans.skip]]
+# windows-targets and windows_* arch crates split alongside windows-sys.
+name = "windows-targets"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_aarch64_gnullvm"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_aarch64_msvc"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_i686_gnu"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_i686_msvc"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_x86_64_gnu"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_x86_64_gnullvm"
+version = "=0.48.5"
+
+[[bans.skip]]
+name = "windows_x86_64_msvc"
+version = "=0.48.5"
+
+[[bans.skip]]
+# wit-bindgen splits between wasmtime generations pulled by different deps.
+name = "wit-bindgen"
+version = "=0.51.0"
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 [sources]

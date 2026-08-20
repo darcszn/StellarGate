@@ -16,24 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-audit-
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      # Fails the job if any dependency has a known RustSec advisory.
-      # --deny warnings escalates unmaintained/unsound advisories to errors.
+      # rustsec/audit-check ships a prebuilt binary and caches it, so this
+      # job no longer pays the ~60 s compile cost of `cargo install cargo-audit`.
       #
       # TEMPORARY IGNORE — RUSTSEC-2023-0071 (Marvin timing side-channel in
       # `rsa`). `rsa` is pulled in only via sqlx's unused MySQL backend (we
@@ -41,7 +25,7 @@ jobs:
       # compiled. It is flagged because it still appears in Cargo.lock.
       #
       # This is a tracked, time-boxed exception, NOT a permanent waiver. Remove
-      # the `--ignore` flag as soon as any removal condition is met:
+      # the `ignore` entry as soon as any removal condition is met:
       #   * a fixed `rsa` release ships, or
       #   * `rsa` leaves the dependency tree, or
       #   * we start enabling sqlx's MySQL backend (then it needs a real fix).
@@ -51,17 +35,27 @@ jobs:
       # The weekly `schedule:` cron above re-runs this audit against a fresh
       # advisory DB, so a newly-published fix surfaces without a code change.
       - name: Run cargo audit
-        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071
 
   deny:
-    name: cargo deny (licenses + advisories + bans)
+    name: cargo deny (licenses + bans + sources + advisories)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
+      # EmbarkStudios/cargo-deny-action ships a prebuilt binary and caches it.
+      # deny.toml at the repo root is picked up automatically.
+      #
+      # Checks run:
+      #   advisories — RustSec advisory database (overlaps with cargo audit;
+      #                belt-and-suspenders for the weekly scheduled run).
+      #   licenses   — every dependency must use an approved SPDX license.
+      #   bans       — banned crates and duplicate-version policy.
+      #   sources    — only crates.io dependencies are permitted.
       - name: Run cargo deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          # deny.toml at repo root is picked up automatically.
-          # Fail on advisories, license violations, and banned crates.
-          command: check all
+          command: check bans licenses sources advisories
