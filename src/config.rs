@@ -88,24 +88,114 @@ pub struct AcceptedAsset {
 }
 
 impl AcceptedAsset {
-    pub(crate) fn parse_list(raw: &str) -> Vec<Self> {
-        raw.split(',')
+    /// Parse a comma-separated `ACCEPTED_ASSETS` string into a validated list
+    /// of assets.
+    ///
+    /// Each entry must be either `CODE` (native XLM only) or `CODE:ISSUER`.
+    /// Validation errors are returned as `Err` so a misconfigured value aborts
+    /// boot with a clear message naming the offending entry, rather than
+    /// propagating silently to a runtime mismatch.
+    ///
+    /// Rules enforced here (at parse time, before strkey validation):
+    /// - The list must not be empty after trimming whitespace and commas.
+    /// - Each code must be 1–12 alphanumeric ASCII characters (Stellar's rule).
+    /// - An entry written as `CODE:` (colon present, issuer absent) is
+    ///   rejected rather than treated as a `Some("")` issuer that then fails
+    ///   strkey validation with a confusing message.
+    /// - Duplicate codes are rejected — two entries sharing a code would let
+    ///   `verify()` accept a payment from either issuer against an intent that
+    ///   stored only the code (issue #222).
+    /// - The issuer is uppercased before being stored, matching what is done
+    ///   for the code. Strkeys are case-sensitive and must be uppercase; a
+    ///   lowercase copy-paste from a lowercased log would otherwise fail the
+    ///   strkey checksum with a confusing message rather than a "bad case" hint.
+    pub(crate) fn parse_list(raw: &str) -> Result<Vec<Self>> {
+        let entries: Vec<&str> = raw
+            .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|entry| {
-                if let Some((code, issuer)) = entry.split_once(':') {
-                    AcceptedAsset {
-                        code: code.trim().to_uppercase(),
-                        issuer: Some(issuer.trim().to_string()),
-                    }
-                } else {
-                    AcceptedAsset {
-                        code: entry.trim().to_uppercase(),
-                        issuer: None,
-                    }
+            .collect();
+
+        if entries.is_empty() {
+            return Err(anyhow::anyhow!(
+                "ACCEPTED_ASSETS is empty. Provide at least one asset, e.g. \"XLM\" or \
+                 \"USDC:GISSUER\"."
+            ));
+        }
+
+        let mut assets = Vec::with_capacity(entries.len());
+        let mut seen_codes = HashSet::new();
+
+        for entry in entries {
+            let (code_raw, issuer_opt) = if let Some((c, i)) = entry.split_once(':') {
+                (c.trim(), Some(i.trim()))
+            } else {
+                (entry.trim(), None)
+            };
+
+            // --- empty code ---------------------------------------------------
+            if code_raw.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS entry {entry:?} has an empty asset code. \
+                     Each entry must start with a non-empty code, e.g. \"XLM\" or \
+                     \"USDC:GISSUER\"."
+                ));
+            }
+
+            // --- Stellar asset-code format: 1–12 alphanumeric ASCII -----------
+            if code_raw.len() > 12
+                || !code_raw
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric())
+            {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS entry {entry:?}: asset code {code_raw:?} is not valid. \
+                     Stellar asset codes must be 1–12 alphanumeric ASCII characters \
+                     (A–Z, a–z, 0–9)."
+                ));
+            }
+
+            let code = code_raw.to_ascii_uppercase();
+
+            // --- empty issuer after colon -------------------------------------
+            let issuer_normalized = if let Some(issuer) = issuer_opt {
+                if issuer.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "ACCEPTED_ASSETS entry {entry:?} has a colon but no issuer. \
+                         Either write the asset as a bare code (native XLM only, e.g. \
+                         \"XLM\") or provide the full issuer address (e.g. \
+                         \"USDC:G...\")."
+                    ));
                 }
-            })
-            .collect()
+
+                // --- uppercase the issuer (fix the code/issuer asymmetry) -----
+                // Strkeys are case-sensitive and must be uppercase. The code is
+                // already uppercased above; we do the same for the issuer so that
+                // a lowercase copy-paste from a log does not produce a confusing
+                // strkey-checksum failure — it is silently normalised here and
+                // then validated by validate_addresses() with a legible message
+                // if the address itself is wrong.
+                Some(issuer.to_ascii_uppercase())
+            } else {
+                None
+            };
+
+            // --- duplicate code -----------------------------------------------
+            if !seen_codes.insert(code.clone()) {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS has duplicate code {code:?}. Stellar asset codes \
+                     are not unique across issuers; pin each code to exactly one issuer \
+                     and remove the duplicate entry."
+                ));
+            }
+
+            assets.push(AcceptedAsset {
+                code,
+                issuer: issuer_normalized,
+            });
+        }
+
+        Ok(assets)
     }
 
     pub fn default_list() -> Vec<Self> {
@@ -446,7 +536,7 @@ impl Config {
                 if raw.is_empty() {
                     AcceptedAsset::default_list()
                 } else {
-                    AcceptedAsset::parse_list(&raw)
+                    AcceptedAsset::parse_list(&raw)?
                 }
             },
             webhook_secret,
@@ -980,7 +1070,7 @@ mod tests {
 
     #[test]
     fn parse_accepted_assets_from_env_string() {
-        let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2");
+        let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2").unwrap();
         assert_eq!(assets.len(), 3);
         assert_eq!(
             assets[0],
@@ -1002,6 +1092,212 @@ mod tests {
                 code: "EURC".into(),
                 issuer: Some("GISSUER2".into())
             }
+        );
+    }
+
+    // ── parse_list validation (issue described in task) ──────────────────────
+
+    /// An empty string after stripping whitespace/commas must be rejected.
+    #[test]
+    fn parse_list_rejects_empty_string() {
+        let err = AcceptedAsset::parse_list("").unwrap_err().to_string();
+        assert!(err.contains("ACCEPTED_ASSETS is empty"), "got: {err}");
+    }
+
+    /// A string that is all commas and spaces is effectively empty.
+    #[test]
+    fn parse_list_rejects_only_commas_and_spaces() {
+        let err = AcceptedAsset::parse_list(" , , ").unwrap_err().to_string();
+        assert!(err.contains("ACCEPTED_ASSETS is empty"), "got: {err}");
+    }
+
+    /// `:GISSUER` → empty code, issuer set. An intent can never name it.
+    #[test]
+    fn parse_list_rejects_empty_code_with_issuer() {
+        let err = AcceptedAsset::parse_list(":GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("empty asset code"),
+            "got: {err}"
+        );
+    }
+
+    /// `USDC:` → colon present but issuer is empty. Should name the entry.
+    #[test]
+    fn parse_list_rejects_code_with_empty_issuer() {
+        let err = AcceptedAsset::parse_list("XLM,USDC:")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("USDC:"), "error must name the entry; got: {err}");
+        assert!(
+            err.contains("colon but no issuer"),
+            "error should explain what is wrong; got: {err}"
+        );
+    }
+
+    /// `VERYLONGASSETCODE` → more than 12 characters; can never match on chain.
+    #[test]
+    fn parse_list_rejects_code_longer_than_12_chars() {
+        let err = AcceptedAsset::parse_list("VERYLONGASSETCODE")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("VERYLONGASSETCODE"),
+            "error must name the offending entry; got: {err}"
+        );
+        assert!(
+            err.contains("1–12 alphanumeric ASCII"),
+            "error should reference the Stellar rule; got: {err}"
+        );
+    }
+
+    /// Non-alphanumeric characters in a code (e.g. hyphens, underscores) are
+    /// not valid Stellar asset codes.
+    #[test]
+    fn parse_list_rejects_code_with_non_alphanumeric_chars() {
+        let err = AcceptedAsset::parse_list("USD-C:GISSUER")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("USD-C"),
+            "error must name the offending entry; got: {err}"
+        );
+        assert!(
+            err.contains("1–12 alphanumeric ASCII"),
+            "error should reference the Stellar rule; got: {err}"
+        );
+    }
+
+    /// `USDC:G…A,USDC:G…B` → duplicate code, different issuers. Silent
+    /// cross-issuer settlement without this check.
+    #[test]
+    fn parse_list_rejects_duplicate_codes() {
+        let err = AcceptedAsset::parse_list(
+            "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5,\
+             USDC:GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZEP8LST4EQXRM5UT3AWMG",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate code"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    /// Duplicate check must be case-insensitive: `usdc` and `USDC` are the
+    /// same code once uppercased.
+    #[test]
+    fn parse_list_rejects_duplicate_codes_case_insensitive() {
+        let err = AcceptedAsset::parse_list(
+            "usdc:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5,\
+             USDC:GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZEP8LST4EQXRM5UT3AWMG",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate code"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    /// `usdc:g…` → code uppercased, issuer uppercased (fixing the asymmetry).
+    /// A lowercase strkey always fails checksum validation, but rather than
+    /// producing a confusing checksum error, parse_list normalises the case and
+    /// lets validate_addresses() produce a clear message if the address itself
+    /// is wrong.
+    #[test]
+    fn parse_list_uppercases_lowercase_issuer() {
+        // Use a lowercase version of a real strkey.
+        let assets = AcceptedAsset::parse_list(
+            "USDC:gbbd47if6lwk7p7mdevscwr7dpuwv3ny3dtqevfl4nat4aqh3zllfla5",
+        )
+        .unwrap();
+        // The code is already upper, and the issuer must be uppercased to match.
+        assert_eq!(assets[0].code, "USDC");
+        assert_eq!(
+            assets[0].issuer.as_deref(),
+            Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        );
+    }
+
+    /// Mixed-case issuer (partially lowercase) should also be uppercased.
+    #[test]
+    fn parse_list_uppercases_mixed_case_issuer() {
+        let assets = AcceptedAsset::parse_list(
+            "USDC:Gbbd47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        )
+        .unwrap();
+        assert_eq!(
+            assets[0].issuer.as_deref(),
+            Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        );
+    }
+
+    /// Lowercase code + lowercase issuer: both are uppercased.
+    #[test]
+    fn parse_list_uppercases_both_code_and_issuer() {
+        let assets = AcceptedAsset::parse_list(
+            "usdc:gbbd47if6lwk7p7mdevscwr7dpuwv3ny3dtqevfl4nat4aqh3zllfla5",
+        )
+        .unwrap();
+        assert_eq!(assets[0].code, "USDC");
+        assert_eq!(
+            assets[0].issuer.as_deref(),
+            Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        );
+    }
+
+    /// Exactly 12 characters is the boundary — must be accepted.
+    #[test]
+    fn parse_list_accepts_12_char_code() {
+        let assets =
+            AcceptedAsset::parse_list("ABCDEFGHIJKL:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+                .unwrap();
+        assert_eq!(assets[0].code, "ABCDEFGHIJKL");
+    }
+
+    /// Exactly 1 character is the lower boundary — must be accepted.
+    #[test]
+    fn parse_list_accepts_single_char_code() {
+        let assets = AcceptedAsset::parse_list("X:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+            .unwrap();
+        assert_eq!(assets[0].code, "X");
+    }
+
+    /// Lowercase code letters are uppercased (existing behaviour preserved).
+    #[test]
+    fn parse_list_uppercases_asset_code() {
+        let assets = AcceptedAsset::parse_list("xlm").unwrap();
+        assert_eq!(assets[0].code, "XLM");
+    }
+
+    /// Numeric characters are valid in Stellar asset codes.
+    #[test]
+    fn parse_list_accepts_alphanumeric_code() {
+        let assets = AcceptedAsset::parse_list("USDC1:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+            .unwrap();
+        assert_eq!(assets[0].code, "USDC1");
+    }
+
+    /// 13-character code — exactly one too long.
+    #[test]
+    fn parse_list_rejects_13_char_code() {
+        let err = AcceptedAsset::parse_list("ABCDEFGHIJKLM:GISSUER")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("1–12 alphanumeric ASCII"),
+            "got: {err}"
+        );
+    }
+
+    /// An entry where only the issuer is provided via `from_env` using an
+    /// empty-ish ACCEPTED_ASSETS value is rejected at parse time, not later.
+    #[test]
+    fn parse_list_error_names_offending_entry() {
+        let entry = "BAD ENTRY";
+        let err = AcceptedAsset::parse_list(entry).unwrap_err().to_string();
+        // The space makes it non-alphanumeric — the error should echo it
+        assert!(
+            err.contains("BAD"),
+            "error must reference the offending entry; got: {err}"
         );
     }
 
